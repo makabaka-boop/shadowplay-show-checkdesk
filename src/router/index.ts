@@ -1,15 +1,22 @@
 import { createRouter, createWebHistory } from 'vue-router'
+import WorkbenchHome from '@/pages/WorkbenchHome.vue'
 import HomePage from '@/pages/HomePage.vue'
 import StoryChecklist from '@/pages/StoryChecklist.vue'
 import HandoverBoard from '@/pages/HandoverBoard.vue'
 import RehearsalPlanList from '@/pages/RehearsalPlanList.vue'
 import RehearsalPlanDetail from '@/pages/RehearsalPlanDetail.vue'
+import InspectionTaskCenter from '@/pages/InspectionTaskCenter.vue'
 
 // 定义路由配置
 const routes = [
   {
     path: '/',
     name: 'home',
+    component: WorkbenchHome,
+  },
+  {
+    path: '/characters',
+    name: 'characters',
     component: HomePage,
   },
   {
@@ -31,6 +38,11 @@ const routes = [
     path: '/rehearsal/:id',
     name: 'rehearsal-detail',
     component: RehearsalPlanDetail,
+  },
+  {
+    path: '/inspection',
+    name: 'inspection',
+    component: InspectionTaskCenter,
   },
   {
     path: '/about',

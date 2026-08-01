@@ -39,6 +39,7 @@ import { useRehearsalPlans } from '../composables/useRehearsalPlans';
 import { useCharacters } from '../composables/useCharacters';
 import { useToast } from '../composables/useToast';
 import { useBatchOperations } from '../composables/useBatchOperations';
+import { useInspectionTasks } from '../composables/useInspectionTasks';
 import type {
   RehearsalPlan,
   RehearsalStatus,
@@ -48,6 +49,8 @@ import type {
   RiskLevel,
   HandoverStatus,
   AccessoryGap,
+  InspectionTask,
+  InspectionSeverity,
 } from '../types';
 import {
   REHEARSAL_STATUS_LABELS,
@@ -55,6 +58,8 @@ import {
   RISK_LABELS,
   HANDOVER_LABELS,
   STATUS_LABELS,
+  INSPECTION_SEVERITY_LABELS,
+  INSPECTION_STATUS_LABELS,
 } from '../types';
 
 const route = useRoute();
@@ -70,8 +75,16 @@ const {
   getValidPlanCharacters,
 } = useRehearsalPlans();
 const { characters, allStories } = useCharacters();
-const { success, warning, error } = useToast();
+const { success, warning, error, info } = useToast();
 const { clearSelection } = useBatchOperations();
+const {
+  tasks,
+  updateTask,
+  resolveTask,
+  getRehearsalTasksByCharacterId,
+  getUnresolvedTasksByCharacterId,
+  syncTaskFromRehearsalResult,
+} = useInspectionTasks();
 
 const planId = computed(() => route.params.id as string);
 const plan = computed<RehearsalPlan | undefined>(() => getPlanById(planId.value));
@@ -182,6 +195,86 @@ const unassignedOwnerCount = computed(() => {
   }).length;
 });
 
+// ==================== 巡检任务统计（计划级） ====================
+
+const severityRank: Record<InspectionSeverity, number> = {
+  low: 0,
+  medium: 1,
+  high: 2,
+  critical: 3,
+};
+
+// 该计划下所有关联的未解决巡检任务（含 rehearsal 及其它来源，按角色反查）
+const planUnresolvedTasks = computed<InspectionTask[]>(() => {
+  void tasks.value;
+  if (!plan.value) return [];
+  const seen = new Set<string>();
+  const result: InspectionTask[] = [];
+  getValidPlanCharacters(plan.value).forEach(vc => {
+    getUnresolvedTasksByCharacterId(vc.characterId).forEach(t => {
+      if (!seen.has(t.id)) {
+        seen.add(t.id);
+        result.push(t);
+      }
+    });
+  });
+  return result;
+});
+
+const planTaskSummary = computed(() => {
+  const list = planUnresolvedTasks.value;
+  let topSeverity: InspectionSeverity | null = null;
+  list.forEach(t => {
+    if (topSeverity === null || severityRank[t.severity] > severityRank[topSeverity]) {
+      topSeverity = t.severity;
+    }
+  });
+  return { unresolved: list.length, topSeverity };
+});
+
+// 某角色关联的未解决任务（供列表行入口/展开面板）
+function unresolvedTasksOf(characterId: string): InspectionTask[] {
+  void tasks.value;
+  return getUnresolvedTasksByCharacterId(characterId)
+    .slice()
+    .sort((a, b) => severityRank[b.severity] - severityRank[a.severity]);
+}
+
+function rehearsalTasksOf(characterId: string): InspectionTask[] {
+  void tasks.value;
+  if (!plan.value) return [];
+  return getRehearsalTasksByCharacterId(plan.value.id, characterId);
+}
+
+function advanceTask(task: InspectionTask) {
+  updateTask(task.id, { status: 'in_progress' });
+  info(`任务已进入处理中：${task.title}`);
+}
+
+function resolveTaskInline(task: InspectionTask) {
+  resolveTask(task.id);
+  success(`已解决任务：${task.title}`);
+}
+
+function jumpToInspectionCenter() {
+  router.push('/inspection');
+}
+
+const taskSeverityClass: Record<InspectionSeverity, string> = {
+  low: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  medium: 'bg-amber-50 text-amber-700 border-amber-200',
+  high: 'bg-orange-50 text-orange-700 border-orange-200',
+  critical: 'bg-red-50 text-red-700 border-red-200',
+};
+
+const taskStatusClass: Record<string, string> = {
+  open: 'bg-sky-50 text-sky-700 border-sky-200',
+  in_progress: 'bg-indigo-50 text-indigo-700 border-indigo-200',
+  blocked: 'bg-rose-50 text-rose-700 border-rose-200',
+  resolved: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  dismissed: 'bg-ink-100 text-ink-500 border-ink-200',
+};
+
 const handoverSummary = computed(() => {
   if (!plan.value) return null;
   const chars = getValidPlanCharacters(plan.value).map(vc => vc.character);
@@ -268,12 +361,13 @@ function cancelEdit() {
 
 function saveEdit() {
   if (!editingCharacterId.value || !plan.value) return;
-  updateCharacterResult(plan.value.id, editingCharacterId.value, {
+  const charId = editingCharacterId.value;
+  updateCharacterResult(plan.value.id, charId, {
     rehearsalResult: editResultForm.result,
     rehearsalNote: editResultForm.note,
     checkedBy: editResultForm.checkedBy,
   });
-  success('已更新排练结果');
+  afterResultSaved(charId, editResultForm.result, editResultForm.note);
   editingCharacterId.value = null;
 }
 
@@ -282,7 +376,38 @@ function quickSetResult(rc: RehearsalCharacter, result: RehearsalResult) {
   updateCharacterResult(plan.value.id, rc.characterId, {
     rehearsalResult: result,
   });
-  success(`已标记为「${REHEARSAL_RESULT_LABELS[result]}」`);
+  afterResultSaved(rc.characterId, result, rc.rehearsalNote);
+}
+
+// 排练结果落库后：把 fail / need_rehearse 转成巡检任务（只补缺，不覆盖用户编辑）
+function afterResultSaved(characterId: string, result: RehearsalResult, rehearsalNote: string) {
+  if (!plan.value) {
+    success(`已更新排练结果`);
+    return;
+  }
+  const char = getFullCharacter(characterId);
+  if (!char) {
+    success(`已更新排练结果`);
+    return;
+  }
+  const label = REHEARSAL_RESULT_LABELS[result];
+  if (result === 'fail' || result === 'need_rehearse') {
+    const task = syncTaskFromRehearsalResult({
+      planId: plan.value.id,
+      story: plan.value.story,
+      char,
+      result,
+      rehearsalNote,
+      defaultAssignee: plan.value.owner,
+    });
+    if (task) {
+      warning(`「${char.name}」标记为「${label}」，已登记巡检任务「${task.title}」`);
+    } else {
+      success(`「${char.name}」已标记为「${label}」`);
+    }
+  } else {
+    success(`「${char.name}」已标记为「${label}」`);
+  }
 }
 
 function addCharacter(characterId: string) {
@@ -507,6 +632,30 @@ const riskIconMap = {
               />
             </div>
           </div>
+        </div>
+
+        <div class="mt-4 pt-4 border-t border-rice-200 flex flex-wrap items-center gap-3">
+          <div class="flex items-center gap-2">
+            <ClipboardList class="w-4 h-4 text-cinnabar-600" />
+            <span class="text-sm font-medium text-ink-700">巡检任务</span>
+          </div>
+          <span class="tag border bg-cinnabar-50 text-cinnabar-700 border-cinnabar-200">
+            未解决 {{ planTaskSummary.unresolved }}
+          </span>
+          <span
+            v-if="planTaskSummary.topSeverity"
+            :class="['tag border', taskSeverityClass[planTaskSummary.topSeverity]]"
+          >
+            最高严重度：{{ INSPECTION_SEVERITY_LABELS[planTaskSummary.topSeverity] }}
+          </span>
+          <span v-else class="text-xs text-ink-400">暂无未解决任务</span>
+          <button
+            class="btn-secondary !py-1 !px-2.5 text-xs ml-auto"
+            @click="jumpToInspectionCenter"
+          >
+            <ClipboardList class="w-3.5 h-3.5" />
+            <span>巡检任务中心</span>
+          </button>
         </div>
       </div>
 
@@ -808,6 +957,13 @@ const riskIconMap = {
                         未分配
                       </span>
                     </template>
+                    <span
+                      v-if="unresolvedTasksOf(rc.characterId).length > 0"
+                      class="tag border bg-cinnabar-50 text-cinnabar-700 border-cinnabar-200 shrink-0 flex items-center gap-1"
+                    >
+                      <ClipboardList class="w-3 h-3" />
+                      {{ unresolvedTasksOf(rc.characterId).length }} 项任务
+                    </span>
                   </div>
 
                   <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 sm:gap-4 mb-2">
@@ -874,6 +1030,76 @@ const riskIconMap = {
                     >
                       <ClipboardCheck class="w-4 h-4 flex-shrink-0 mt-0.5" />
                       <span>交接备注：{{ getFullCharacter(rc.characterId)!.handoverNote }}</span>
+                    </div>
+
+                    <!-- 关联巡检任务 -->
+                    <div
+                      v-if="unresolvedTasksOf(rc.characterId).length > 0"
+                      class="rounded-md border border-cinnabar-200 bg-rice-50 p-2.5"
+                      @click.stop
+                    >
+                      <div class="flex items-center justify-between gap-2 mb-1.5">
+                        <div class="flex items-center gap-1.5 text-xs font-medium text-ink-600">
+                          <ClipboardList class="w-3.5 h-3.5 text-cinnabar-600" />
+                          关联巡检任务
+                          <span class="text-cinnabar-600">（{{ unresolvedTasksOf(rc.characterId).length }} 项未解决）</span>
+                          <span
+                            v-if="rehearsalTasksOf(rc.characterId).length > 0"
+                            class="tag border bg-cinnabar-50 text-cinnabar-700 border-cinnabar-200 text-[11px]"
+                          >
+                            含排练任务
+                          </span>
+                        </div>
+                        <button
+                          class="text-[11px] text-cinnabar-600 hover:text-cinnabar-700"
+                          @click.stop="jumpToInspectionCenter"
+                        >
+                          巡检任务中心 →
+                        </button>
+                      </div>
+                      <ul class="space-y-1.5">
+                        <li
+                          v-for="task in unresolvedTasksOf(rc.characterId)"
+                          :key="task.id"
+                          class="rounded-md border border-ink-100 bg-white p-2"
+                        >
+                          <div class="flex items-center gap-2 flex-wrap">
+                            <span :class="['px-1.5 py-0.5 rounded border text-[11px]', taskSeverityClass[task.severity]]">
+                              {{ INSPECTION_SEVERITY_LABELS[task.severity] }}
+                            </span>
+                            <span :class="['px-1.5 py-0.5 rounded border text-[11px]', taskStatusClass[task.status]]">
+                              {{ INSPECTION_STATUS_LABELS[task.status] }}
+                            </span>
+                            <span
+                              v-if="task.sourceType === 'rehearsal'"
+                              class="px-1.5 py-0.5 rounded border text-[11px] bg-cinnabar-50 text-cinnabar-700 border-cinnabar-200"
+                            >
+                              排练
+                            </span>
+                            <span class="flex-1 min-w-0 text-xs text-ink-700 break-words">{{ task.title }}</span>
+                          </div>
+                          <p v-if="task.description" class="mt-1 text-[11px] text-ink-500 whitespace-pre-line break-words">
+                            {{ task.description }}
+                          </p>
+                          <div class="flex items-center gap-2 mt-1.5">
+                            <span class="text-[11px] text-ink-400">责任人：{{ task.assignee || '（空）' }}</span>
+                            <button
+                              v-if="task.status === 'open'"
+                              class="text-[11px] px-2 py-0.5 rounded border border-indigo-200 text-indigo-600 hover:bg-indigo-50 ml-auto"
+                              @click.stop="advanceTask(task)"
+                            >
+                              开始处理
+                            </button>
+                            <button
+                              class="text-[11px] px-2 py-0.5 rounded border border-emerald-200 text-emerald-600 hover:bg-emerald-50"
+                              :class="task.status === 'open' ? '' : 'ml-auto'"
+                              @click.stop="resolveTaskInline(task)"
+                            >
+                              解决
+                            </button>
+                          </div>
+                        </li>
+                      </ul>
                     </div>
 
                     <div v-if="editingCharacterId !== rc.characterId && plan.status !== 'completed' && plan.status !== 'cancelled'" class="flex flex-wrap gap-2 pt-2 border-t border-rice-100">

@@ -24,15 +24,32 @@ import {
 } from 'lucide-vue-next';
 import TopBar from '../components/TopBar.vue';
 import ToastContainer from '../components/ToastContainer.vue';
+import { useRouter } from 'vue-router';
 import { useCharacters } from '../composables/useCharacters';
 import { useToast } from '../composables/useToast';
 import { useBatchOperations } from '../composables/useBatchOperations';
-import type { Character, HandoverStatus, RiskLevel } from '../types';
-import { HANDOVER_LABELS, RISK_LABELS } from '../types';
+import { useInspectionTasks } from '../composables/useInspectionTasks';
+import type { Character, HandoverStatus, RiskLevel, InspectionTask, InspectionSeverity } from '../types';
+import {
+  HANDOVER_LABELS,
+  RISK_LABELS,
+  INSPECTION_SEVERITY_LABELS,
+  INSPECTION_STATUS_LABELS,
+} from '../types';
 
+const router = useRouter();
 const { characters, allStories, updateCharacter } = useCharacters();
-const { success, warning } = useToast();
+const { success, warning, info } = useToast();
 const { clearSelection } = useBatchOperations();
+const {
+  tasks,
+  updateTask,
+  resolveTask,
+  getHandoverTasksByCharacterId,
+  getUnresolvedTasksByCharacterId,
+  upsertHandoverBlockTask,
+  syncHandoverNoteToTask,
+} = useInspectionTasks();
 
 const selectedStory = ref<string>('');
 const selectedOwner = ref<string>('');
@@ -256,24 +273,39 @@ function cancelEdit() {
 
 function saveEdit(char: Character) {
   if (editHandoverStatus.value === 'confirmed' && hasObjectiveRisk(char)) {
-    warning('该角色存在缺件、高风险或未分配责任人，无法标记为可交接');
+    interceptRiskyConfirm(char);
     return;
   }
   updateCharacter(char.id, {
     handoverStatus: editHandoverStatus.value,
     handoverNote: editHandoverNote.value,
   });
-  success(`已更新「${char.name}」的交接状态`);
+  // 备注变化同步到已存在的交接任务描述
+  const synced = char.story
+    ? syncHandoverNoteToTask({ ...char, handoverNote: editHandoverNote.value })
+    : null;
+  success(`已更新「${char.name}」的交接状态${synced ? '，交接备注已同步至关联任务' : ''}`);
   editingId.value = null;
 }
 
 function quickHandoverStatus(char: Character, status: HandoverStatus) {
   if (status === 'confirmed' && hasObjectiveRisk(char)) {
-    warning('该角色存在缺件、高风险或未分配责任人，无法标记为可交接');
+    interceptRiskyConfirm(char);
     return;
   }
   updateCharacter(char.id, { handoverStatus: status });
   success(`「${char.name}」已标记为「${HANDOVER_LABELS[status]}」`);
+}
+
+// 拦截“可交接”确认：创建/更新 sourceType='handover' 任务，并升级 toast 文案
+function interceptRiskyConfirm(char: Character) {
+  const task = upsertHandoverBlockTask(char);
+  const ownerHint = char.owner
+    ? `已指派责任人「${char.owner}」`
+    : '责任人为空，已生成「分配责任人」任务';
+  warning(
+    `「${char.name}」存在客观风险，无法标记为可交接；已${task ? '登记' : '更新'}巡检任务「${task.title}」（${ownerHint}）`
+  );
 }
 
 function selectNextStory() {
@@ -297,6 +329,58 @@ function selectPrevStory() {
 function goBack() {
   window.history.back();
 }
+
+// ==================== 关联巡检任务面板 ====================
+
+const severityRank: Record<InspectionSeverity, number> = {
+  critical: 0,
+  high: 1,
+  medium: 2,
+  low: 3,
+};
+
+// 某角色关联的未解决任务（含 handover 与其它来源），供交接页展示
+function relatedUnresolvedTasks(char: Character): InspectionTask[] {
+  void tasks.value;
+  return getUnresolvedTasksByCharacterId(char.id)
+    .slice()
+    .sort((a, b) => severityRank[a.severity] - severityRank[b.severity]);
+}
+
+// 某角色的交接任务（含已解决），用于统计标记
+function handoverTasksOf(char: Character): InspectionTask[] {
+  void tasks.value;
+  return getHandoverTasksByCharacterId(char.id);
+}
+
+function advanceTask(task: InspectionTask) {
+  updateTask(task.id, { status: 'in_progress' });
+  info(`任务已进入处理中：${task.title}`);
+}
+
+function resolveTaskInline(task: InspectionTask) {
+  resolveTask(task.id);
+  success(`已解决任务：${task.title}`);
+}
+
+function jumpToInspectionCenter() {
+  router.push('/inspection');
+}
+
+const taskSeverityClass: Record<InspectionSeverity, string> = {
+  low: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  medium: 'bg-amber-50 text-amber-700 border-amber-200',
+  high: 'bg-orange-50 text-orange-700 border-orange-200',
+  critical: 'bg-red-50 text-red-700 border-red-200',
+};
+
+const taskStatusClass: Record<string, string> = {
+  open: 'bg-sky-50 text-sky-700 border-sky-200',
+  in_progress: 'bg-indigo-50 text-indigo-700 border-indigo-200',
+  blocked: 'bg-rose-50 text-rose-700 border-rose-200',
+  resolved: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  dismissed: 'bg-ink-100 text-ink-500 border-ink-200',
+};
 
 const handoverColors: Record<HandoverStatus, string> = {
   not_checked: 'bg-gray-50 text-gray-600 border-gray-200',
@@ -780,6 +864,78 @@ const preparationPercentage = computed(() => {
                             <AlertOctagon class="w-4 h-4 flex-shrink-0" />
                             <span>该角色存在客观风险（缺件/高风险/未分配责任人），不能标记为「可交接」</span>
                           </p>
+                        </div>
+
+                        <!-- 关联巡检任务面板 -->
+                        <div
+                          v-if="relatedUnresolvedTasks(char).length > 0"
+                          class="rounded-md border border-cinnabar-200 bg-rice-50 p-2.5"
+                          @click.stop
+                        >
+                          <div class="flex items-center justify-between gap-2 mb-1.5">
+                            <div class="flex items-center gap-1.5 text-xs font-medium text-ink-600">
+                              <ListTodo class="w-3.5 h-3.5 text-cinnabar-600" />
+                              关联巡检任务
+                              <span class="text-cinnabar-600">（{{ relatedUnresolvedTasks(char).length }} 项未解决）</span>
+                              <span
+                                v-if="handoverTasksOf(char).length > 0"
+                                class="tag border bg-cinnabar-50 text-cinnabar-700 border-cinnabar-200 text-[11px]"
+                              >
+                                含交接任务
+                              </span>
+                            </div>
+                            <button
+                              class="text-[11px] text-cinnabar-600 hover:text-cinnabar-700 inline-flex items-center gap-1"
+                              @click.stop="jumpToInspectionCenter"
+                            >
+                              巡检任务中心 →
+                            </button>
+                          </div>
+                          <ul class="space-y-1.5">
+                            <li
+                              v-for="task in relatedUnresolvedTasks(char)"
+                              :key="task.id"
+                              class="rounded-md border border-ink-100 bg-white p-2"
+                            >
+                              <div class="flex items-center gap-2 flex-wrap">
+                                <span :class="['px-1.5 py-0.5 rounded border text-[11px]', taskSeverityClass[task.severity]]">
+                                  {{ INSPECTION_SEVERITY_LABELS[task.severity] }}
+                                </span>
+                                <span :class="['px-1.5 py-0.5 rounded border text-[11px]', taskStatusClass[task.status]]">
+                                  {{ INSPECTION_STATUS_LABELS[task.status] }}
+                                </span>
+                                <span
+                                  v-if="task.sourceType === 'handover'"
+                                  class="px-1.5 py-0.5 rounded border text-[11px] bg-cinnabar-50 text-cinnabar-700 border-cinnabar-200"
+                                >
+                                  交接
+                                </span>
+                                <span class="flex-1 min-w-0 text-xs text-ink-700 break-words">{{ task.title }}</span>
+                              </div>
+                              <p v-if="task.description" class="mt-1 text-[11px] text-ink-500 whitespace-pre-line break-words">
+                                {{ task.description }}
+                              </p>
+                              <div class="flex items-center gap-2 mt-1.5">
+                                <span class="text-[11px] text-ink-400">
+                                  责任人：{{ task.assignee || '（空）' }}
+                                </span>
+                                <button
+                                  v-if="task.status === 'open'"
+                                  class="text-[11px] px-2 py-0.5 rounded border border-indigo-200 text-indigo-600 hover:bg-indigo-50 ml-auto"
+                                  @click.stop="advanceTask(task)"
+                                >
+                                  开始处理
+                                </button>
+                                <button
+                                  class="text-[11px] px-2 py-0.5 rounded border border-emerald-200 text-emerald-600 hover:bg-emerald-50"
+                                  :class="task.status === 'open' ? '' : 'ml-auto'"
+                                  @click.stop="resolveTaskInline(task)"
+                                >
+                                  解决
+                                </button>
+                              </div>
+                            </li>
+                          </ul>
                         </div>
 
                         <div v-if="editingId !== char.id" class="flex flex-wrap gap-2 pt-2 border-t border-rice-100">

@@ -1,6 +1,9 @@
-import type { Character } from '../types';
+import type { Character, InspectionTask } from '../types';
 
 const now = new Date().toISOString();
+
+const dayFromNow = (days: number): string =>
+  new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
 
 export const mockCharacters: Character[] = [
   {
@@ -259,6 +262,135 @@ export const mockCharacters: Character[] = [
     operationReminders: ['核实角色是否需要操作连杆'],
     handoverStatus: 'not_checked',
     handoverNote: '',
+    createdAt: now,
+    updatedAt: now,
+  },
+];
+
+export const mockInspectionTasks: InspectionTask[] = [
+  // 三打白骨精 —— 缺件任务（来源：角色清单）
+  {
+    id: 'task_demo_001',
+    sourceType: 'character',
+    sourceId: 'char_demo_001',
+    story: '三打白骨精',
+    characterId: 'char_demo_001',
+    planId: '',
+    title: '补齐孙悟空的金箍棒',
+    description: '金箍棒需补 1 件（当前 0/1）。曾在演出中脱落，补件后需加固连接处。',
+    severity: 'high',
+    status: 'open',
+    assignee: '张师傅',
+    dueAt: dayFromNow(2),
+    resolvedAt: '',
+    createdAt: now,
+    updatedAt: now,
+  },
+  // 三打白骨精 —— 高风险复核（来源：角色清单）
+  {
+    id: 'task_demo_002',
+    sourceType: 'character',
+    sourceId: 'char_demo_005',
+    story: '三打白骨精',
+    characterId: 'char_demo_005',
+    planId: '',
+    title: '复核白骨精风险说明',
+    description: '变身机关复杂，上次演出出现故障，属极高风险角色，需重点复核并准备备用机关。',
+    severity: 'critical',
+    status: 'in_progress',
+    assignee: '张师傅',
+    dueAt: dayFromNow(1),
+    resolvedAt: '',
+    createdAt: now,
+    updatedAt: now,
+  },
+  // 三打白骨精 —— 未分配责任人（来源：角色清单）
+  {
+    id: 'task_demo_003',
+    sourceType: 'character',
+    sourceId: 'char_demo_006',
+    story: '三打白骨精',
+    characterId: 'char_demo_006',
+    planId: '',
+    title: '分配老汉责任人',
+    description: '该角色尚未指定责任人，需尽快安排交接负责人。',
+    severity: 'medium',
+    status: 'open',
+    assignee: '',
+    dueAt: '',
+    resolvedAt: '',
+    createdAt: now,
+    updatedAt: now,
+  },
+  // 三打白骨精 —— 来自交接核对
+  {
+    id: 'task_demo_004',
+    sourceType: 'handover',
+    sourceId: 'char_demo_003',
+    story: '三打白骨精',
+    characterId: 'char_demo_003',
+    planId: '',
+    title: '复核猪八戒风险说明',
+    description: '交接核对发现九齿钉耙和耳朵连杆均缺失，存在风险，需紧急采购后再确认交接。',
+    severity: 'high',
+    status: 'open',
+    assignee: '王师傅',
+    dueAt: dayFromNow(1),
+    resolvedAt: '',
+    createdAt: now,
+    updatedAt: now,
+  },
+  // 木兰从军 —— 来自排练计划
+  {
+    id: 'task_demo_005',
+    sourceType: 'rehearsal',
+    sourceId: 'rh_sample_002',
+    story: '木兰从军',
+    characterId: 'char_demo_009',
+    planId: 'rh_sample_002',
+    title: '复核单于风险说明',
+    description: '排练结果为「需复排」：关节操作配合需加强，建议双人配合操作后再次排练。',
+    severity: 'high',
+    status: 'open',
+    assignee: '李导演',
+    dueAt: dayFromNow(3),
+    resolvedAt: '',
+    createdAt: now,
+    updatedAt: now,
+  },
+  // 木兰从军 —— 缺件任务（来源：角色清单）
+  {
+    id: 'task_demo_006',
+    sourceType: 'character',
+    sourceId: 'char_demo_009',
+    story: '木兰从军',
+    characterId: 'char_demo_009',
+    planId: '',
+    title: '补齐单于的弯刀',
+    description: '弯刀需补 1 件（当前 0/1）。需确认是否有备用件。',
+    severity: 'high',
+    status: 'open',
+    assignee: '周师傅',
+    dueAt: dayFromNow(2),
+    resolvedAt: '',
+    createdAt: now,
+    updatedAt: now,
+  },
+  // 木兰从军 —— 手工创建
+  {
+    id: 'task_demo_007',
+    sourceType: 'manual',
+    sourceId: '',
+    story: '木兰从军',
+    characterId: 'char_demo_007',
+    planId: '',
+    title: '统一检查木兰从军灯光配合',
+    description: '手工创建：花木兰出场动作需配合灯光效果，安排一次专项灯光走位检查。',
+    severity: 'low',
+    status: 'open',
+    assignee: '刘师傅',
+    dueAt: dayFromNow(4),
+    resolvedAt: '',
     createdAt: now,
     updatedAt: now,
   },
