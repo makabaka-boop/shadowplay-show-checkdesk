@@ -2,6 +2,7 @@ import { ref, computed, watch } from 'vue';
 import type { RehearsalPlan, RehearsalCharacter, RehearsalStatus, RehearsalResult, Character } from '../types';
 import { normalizeRehearsalPlan } from '../types';
 import { useCharacters } from './useCharacters';
+import { useInspectionTasks } from './useInspectionTasks';
 
 const STORAGE_KEY = 'shadow-puppetry-rehearsal-plans';
 
@@ -87,9 +88,23 @@ watch(rehearsalPlans, (newVal) => {
 
 export function useRehearsalPlans() {
   const { characters } = useCharacters();
+  const {
+    syncTasksFromCharacters,
+    upsertRehearsalResultTask,
+    resolveRehearsalResultTaskIfAuto,
+    blockTasksForRemovedPlanCharacter,
+  } = useInspectionTasks();
+
+  function triggerTaskSync() {
+    try { syncTasksFromCharacters(characters.value, rehearsalPlans.value); } catch { /* noop */ }
+  }
 
   watch(characters, () => {
     cleanInvalidCharacters();
+  }, { deep: true });
+
+  watch(rehearsalPlans, () => {
+    triggerTaskSync();
   }, { deep: true });
 
   function cleanInvalidCharacters() {
@@ -106,6 +121,9 @@ export function useRehearsalPlans() {
         changed = true;
       }
     });
+    if (changed) {
+      triggerTaskSync();
+    }
     return changed;
   }
 
@@ -189,9 +207,17 @@ export function useRehearsalPlans() {
     const plan = getPlanById(planId);
     if (!plan) return null;
 
-    return updatePlan(planId, {
+    const character = characters.value.find(c => c.id === characterId);
+    const removed = updatePlan(planId, {
       characters: plan.characters.filter(c => c.characterId !== characterId),
     });
+
+    if (removed) {
+      try {
+        blockTasksForRemovedPlanCharacter(planId, characterId, character?.name);
+      } catch { /* noop */ }
+    }
+    return removed;
   }
 
   function updateCharacterResult(
@@ -202,11 +228,39 @@ export function useRehearsalPlans() {
     const plan = getPlanById(planId);
     if (!plan) return null;
 
-    return updatePlan(planId, {
+    const current = plan.characters.find(c => c.characterId === characterId);
+    const nextResult: RehearsalResult =
+      updates.rehearsalResult !== undefined ? updates.rehearsalResult : current?.rehearsalResult || 'not_started';
+    const nextNote = updates.rehearsalNote !== undefined ? updates.rehearsalNote : current?.rehearsalNote || '';
+    const nextCheckedBy = updates.checkedBy !== undefined ? updates.checkedBy : current?.checkedBy || '';
+
+    const updated = updatePlan(planId, {
       characters: plan.characters.map(c =>
         c.characterId === characterId ? { ...c, ...updates } : c
       ),
     });
+
+    if (updated) {
+      const latestPlan = getPlanById(planId);
+      const character = characters.value.find(c => c.id === characterId);
+      if (latestPlan && character) {
+        try {
+          if (nextResult === 'fail' || nextResult === 'need_rehearse') {
+            upsertRehearsalResultTask(
+              latestPlan,
+              character,
+              nextResult,
+              nextNote,
+              nextCheckedBy
+            );
+          } else if (nextResult === 'pass') {
+            resolveRehearsalResultTaskIfAuto(planId, characterId);
+          }
+        } catch { /* noop */ }
+      }
+    }
+
+    return updated;
   }
 
   function moveCharacterOrder(planId: string, characterId: string, direction: 'up' | 'down', visibleCharacterIds?: string[]) {
@@ -259,6 +313,49 @@ export function useRehearsalPlans() {
     return { total, pass, fail, needRehearse, notStarted, progress, passRate };
   }
 
+  function exportData(): string {
+    return JSON.stringify(rehearsalPlans.value, null, 2);
+  }
+
+  function importData(json: string): { success: boolean; count: number; invalidCount: number; duplicateCount: number } {
+    try {
+      const parsed = JSON.parse(json);
+      if (!Array.isArray(parsed)) {
+        return { success: false, count: 0, invalidCount: 0, duplicateCount: 0 };
+      }
+      const existingIds = new Set(rehearsalPlans.value.map(p => p.id));
+      const normalized: RehearsalPlan[] = [];
+      let invalidCount = 0;
+      let duplicateCount = 0;
+
+      parsed.forEach((item) => {
+        if (!item || typeof item !== 'object') {
+          invalidCount++;
+          return;
+        }
+        try {
+          let plan = normalizeRehearsalPlan(item);
+          if (existingIds.has(plan.id)) {
+            plan = normalizeRehearsalPlan({
+              ...plan,
+              id: 'rh_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+            });
+            duplicateCount++;
+          }
+          existingIds.add(plan.id);
+          normalized.push(plan);
+        } catch {
+          invalidCount++;
+        }
+      });
+
+      rehearsalPlans.value = normalized;
+      return { success: true, count: normalized.length, invalidCount, duplicateCount };
+    } catch {
+      return { success: false, count: 0, invalidCount: 0, duplicateCount: 0 };
+    }
+  }
+
   return {
     rehearsalPlans,
     addPlan,
@@ -274,5 +371,7 @@ export function useRehearsalPlans() {
     getPlanStats,
     getValidPlanCharacters,
     cleanInvalidCharacters,
+    exportData,
+    importData,
   };
 }

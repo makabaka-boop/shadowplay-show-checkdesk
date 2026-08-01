@@ -13,12 +13,16 @@ import {
   Home,
   ClipboardCheck,
   Theater,
+  Flag,
+  Package,
 } from 'lucide-vue-next';
 import { useCharacters } from '../composables/useCharacters';
 import { useAutoCheck } from '../composables/useAutoCheck';
 import { useDemoMode } from '../composables/useDemoMode';
 import { useToast } from '../composables/useToast';
 import { useBatchOperations } from '../composables/useBatchOperations';
+import { useInspectionTasks } from '../composables/useInspectionTasks';
+import { useBackupPackage } from '../composables/useBackupPackage';
 import type { CharacterStatus } from '../types';
 import { STATUS_LABELS, BATCH_STATUSES } from '../types';
 
@@ -38,6 +42,8 @@ const { errorCount, warningCount } = useAutoCheck();
 const { isDemoMode, toggleDemoMode } = useDemoMode();
 const { success, error, warning } = useToast();
 const { selectedIds, hasSelection, selectedCount, batchUpdateStatus, clearSelection } = useBatchOperations();
+const { stats: taskStats } = useInspectionTasks();
+const { exportPackage, importPackage, isBackupPackage } = useBackupPackage();
 
 const fileInputRef = ref<HTMLInputElement | null>(null);
 const showBatchMenu = ref(false);
@@ -54,6 +60,18 @@ function handleExport() {
   success(`已保存 ${characters.value.length} 条角色核对记录`);
 }
 
+function handleBackupExport() {
+  const json = exportPackage();
+  const blob = new Blob([json], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `皮影检查台备份包_v2_${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+  success('检查台备份包已导出（角色、排练计划、巡检任务）');
+}
+
 function triggerImport() {
   fileInputRef.value?.click();
 }
@@ -66,17 +84,51 @@ function handleFileChange(event: Event) {
   const reader = new FileReader();
   reader.onload = (e) => {
     const content = e.target?.result as string;
-    const result = importData(content);
-    if (result.success) {
-      if (result.invalidCount > 0) {
-        warning(`已载入 ${result.count} 条核对记录，另有 ${result.invalidCount} 条格式异常已跳过或补全`);
-      } else {
-        success(`已载入 ${result.count} 条角色核对记录`);
-      }
-      clearSelection();
-      emit('dataImported');
-    } else {
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
       error('载入失败：文件格式不正确或内容损坏');
+      target.value = '';
+      return;
+    }
+
+    if (isBackupPackage(parsed)) {
+      const result = importPackage(content);
+      if (result.success) {
+        const messages: string[] = [
+          `已恢复角色 ${result.characterCount} 条`,
+          `排练计划 ${result.rehearsalPlanCount} 条`,
+          `巡检任务 ${result.inspectionTaskCount} 条`,
+        ];
+        if (result.duplicateCount > 0) {
+          messages.push(`${result.duplicateCount} 个重复 id 已自动重建`);
+        }
+        if (result.blockedCount > 0) {
+          messages.push(`${result.blockedCount} 个任务因关联角色/计划缺失已置为 blocked`);
+        }
+        if (result.invalidCount > 0) {
+          messages.push(`${result.invalidCount} 条异常数据已跳过`);
+        }
+        success(`检查台备份包已恢复：${messages.join('，')}`);
+        clearSelection();
+        emit('dataImported');
+      } else {
+        error(`备份包恢复失败：${result.error || '未知错误'}`);
+      }
+    } else {
+      const result = importData(content);
+      if (result.success) {
+        if (result.invalidCount > 0) {
+          warning(`已载入 ${result.count} 条核对记录，另有 ${result.invalidCount} 条格式异常已跳过或补全`);
+        } else {
+          success(`已载入 ${result.count} 条角色核对记录`);
+        }
+        clearSelection();
+        emit('dataImported');
+      } else {
+        error('载入失败：文件格式不正确或内容损坏');
+      }
     }
   };
   reader.onerror = () => {
@@ -117,13 +169,27 @@ function handleBatchStatus(status: CharacterStatus) {
           <button
             :class="[
               'inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-all',
-              router.currentRoute.value.name === 'home'
+              router.currentRoute.value.name === 'dashboard'
                 ? 'bg-white/20 text-white'
                 : 'bg-white/10 text-rice-100 hover:bg-white/20'
             ]"
             @click="router.push('/')"
           >
             <Home class="w-4 h-4" />
+            <span class="hidden sm:inline">工作台</span>
+            <span class="sm:hidden">首页</span>
+          </button>
+
+          <button
+            :class="[
+              'inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-all',
+              router.currentRoute.value.name === 'home'
+                ? 'bg-white/20 text-white'
+                : 'bg-white/10 text-rice-100 hover:bg-white/20'
+            ]"
+            @click="router.push('/characters')"
+          >
+            <ClipboardList class="w-4 h-4" />
             <span class="hidden sm:inline">角色核对</span>
             <span class="sm:hidden">核对</span>
           </button>
@@ -170,6 +236,26 @@ function handleBatchStatus(status: CharacterStatus) {
             <span class="sm:hidden">排练</span>
           </button>
 
+          <button
+            :class="[
+              'inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-all relative',
+              router.currentRoute.value.name === 'inspection'
+                ? 'bg-white/20 text-white'
+                : 'bg-white/10 text-rice-100 hover:bg-white/20'
+            ]"
+            @click="router.push('/inspection')"
+          >
+            <Flag class="w-4 h-4" />
+            <span class="hidden sm:inline">巡检任务</span>
+            <span class="sm:hidden">任务</span>
+            <span
+              v-if="taskStats.open + taskStats.inProgress + taskStats.blocked > 0"
+              class="absolute -top-1 -right-1 min-w-[18px] h-[18px] px-1 rounded-full bg-red-500 text-white text-[10px] font-bold flex items-center justify-center shadow"
+            >
+              {{ taskStats.open + taskStats.inProgress + taskStats.blocked }}
+            </span>
+          </button>
+
           <div class="flex items-center gap-2 mx-2 bg-white/10 rounded-md px-3 py-1.5">
             <AlertCircle class="w-4 h-4 text-rice-200" />
             <span class="text-xs">共 <span class="font-bold text-rice-100">{{ characters.length }}</span> 个角色</span>
@@ -195,13 +281,21 @@ function handleBatchStatus(status: CharacterStatus) {
             <span class="sm:hidden">核对</span>
           </button>
 
-          <button class="btn-secondary !py-1.5 !bg-white/10 !text-white !border-white/20 hover:!bg-white/20" @click="triggerImport">
+          <button class="btn-secondary !py-1.5 !bg-white/10 !text-white !border-white/20 hover:!bg-white/20" @click="triggerImport" title="载入角色备份或检查台备份包">
             <Upload class="w-4 h-4" />
             <span class="hidden sm:inline">载入</span>
           </button>
-          <button class="btn-secondary !py-1.5 !bg-white/10 !text-white !border-white/20 hover:!bg-white/20" @click="handleExport">
+          <button class="btn-secondary !py-1.5 !bg-white/10 !text-white !border-white/20 hover:!bg-white/20" @click="handleExport" title="仅导出角色核对数据">
             <Download class="w-4 h-4" />
-            <span class="hidden sm:inline">备份</span>
+            <span class="hidden sm:inline">角色备份</span>
+          </button>
+          <button
+            class="btn-secondary !py-1.5 !bg-gold-500/90 !text-white !border-gold-400 hover:!bg-gold-500 inline-flex items-center gap-1.5"
+            @click="handleBackupExport"
+            title="导出检查台备份包（角色+排练计划+巡检任务）"
+          >
+            <Package class="w-4 h-4" />
+            <span class="hidden sm:inline">备份包</span>
           </button>
 
           <div class="relative" v-if="hasSelection">

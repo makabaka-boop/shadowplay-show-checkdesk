@@ -186,6 +186,106 @@ export const REHEARSAL_RESULT_LABELS: Record<RehearsalResult, string> = {
   need_rehearse: '需复排',
 };
 
+export type TaskSourceType = 'character' | 'handover' | 'rehearsal' | 'manual';
+
+export type TaskSeverity = 'low' | 'medium' | 'high' | 'critical';
+
+export type TaskStatus = 'open' | 'in_progress' | 'blocked' | 'resolved' | 'dismissed';
+
+export interface InspectionTask {
+  id: string;
+  sourceType: TaskSourceType;
+  sourceId: string;
+  story: string;
+  characterId: string | null;
+  planId: string | null;
+  title: string;
+  description: string;
+  severity: TaskSeverity;
+  status: TaskStatus;
+  assignee: string;
+  dueAt: string;
+  resolvedAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export const TASK_SOURCE_LABELS: Record<TaskSourceType, string> = {
+  character: '角色清单',
+  handover: '交接核对',
+  rehearsal: '排练计划',
+  manual: '手工创建',
+};
+
+export const TASK_SEVERITY_LABELS: Record<TaskSeverity, string> = {
+  low: '低',
+  medium: '中',
+  high: '高',
+  critical: '严重',
+};
+
+export const TASK_STATUS_LABELS: Record<TaskStatus, string> = {
+  open: '待处理',
+  in_progress: '进行中',
+  blocked: '已阻塞',
+  resolved: '已解决',
+  dismissed: '已忽略',
+};
+
+export function normalizeInspectionTask(raw: any): InspectionTask {
+  const sourceTypes: TaskSourceType[] = ['character', 'handover', 'rehearsal', 'manual'];
+  const severities: TaskSeverity[] = ['low', 'medium', 'high', 'critical'];
+  const statuses: TaskStatus[] = ['open', 'in_progress', 'blocked', 'resolved', 'dismissed'];
+
+  const now = new Date().toISOString();
+  const safeStr = (v: any, fallback = ''): string =>
+    typeof v === 'string' ? v : v != null ? String(v) : fallback;
+
+  const sourceType = safeStr(raw?.sourceType, 'manual');
+  const severity = safeStr(raw?.severity, 'low');
+  const status = safeStr(raw?.status, 'open');
+
+  return {
+    id: safeStr(raw?.id, 'task_' + Math.random().toString(36).slice(2, 12)),
+    sourceType: sourceTypes.includes(sourceType as TaskSourceType) ? (sourceType as TaskSourceType) : 'manual',
+    sourceId: safeStr(raw?.sourceId, ''),
+    story: safeStr(raw?.story, '未分类'),
+    characterId: raw?.characterId != null ? safeStr(raw.characterId, '') : null,
+    planId: raw?.planId != null ? safeStr(raw.planId, '') : null,
+    title: safeStr(raw?.title, '未命名任务'),
+    description: safeStr(raw?.description, ''),
+    severity: severities.includes(severity as TaskSeverity) ? (severity as TaskSeverity) : 'low',
+    status: statuses.includes(status as TaskStatus) ? (status as TaskStatus) : 'open',
+    assignee: safeStr(raw?.assignee, ''),
+    dueAt: safeStr(raw?.dueAt, ''),
+    resolvedAt: safeStr(raw?.resolvedAt, ''),
+    createdAt: safeStr(raw?.createdAt, now),
+    updatedAt: safeStr(raw?.updatedAt, now),
+  };
+}
+
+export const BACKUP_PACKAGE_VERSION = 2;
+
+export interface CheckdeskBackupPackage {
+  version: number;
+  exportedAt: string;
+  characters: Character[];
+  rehearsalPlans: RehearsalPlan[];
+  inspectionTasks: InspectionTask[];
+}
+
+export function normalizeBackupPackage(raw: any): CheckdeskBackupPackage {
+  const now = new Date().toISOString();
+  const safeArr = <T>(v: any): T[] => (Array.isArray(v) ? v : []);
+  return {
+    version: typeof raw?.version === 'number' ? raw.version : BACKUP_PACKAGE_VERSION,
+    exportedAt: typeof raw?.exportedAt === 'string' ? raw.exportedAt : now,
+    characters: safeArr<any>(raw?.characters).map((c) => normalizeCharacter(c)),
+    rehearsalPlans: safeArr<any>(raw?.rehearsalPlans).map((p) => normalizeRehearsalPlan(p)),
+    inspectionTasks: safeArr<any>(raw?.inspectionTasks).map((t) => normalizeInspectionTask(t)),
+  };
+}
+
 export function normalizeRehearsalPlan(raw: any): RehearsalPlan {
   const statuses: RehearsalStatus[] = ['draft', 'scheduled', 'in_progress', 'completed', 'cancelled'];
   const results: RehearsalResult[] = ['not_started', 'pass', 'fail', 'need_rehearse'];
