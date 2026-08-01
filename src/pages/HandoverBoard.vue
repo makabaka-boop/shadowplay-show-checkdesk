@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue';
+import { useRouter } from 'vue-router';
 import {
   ChevronLeft,
   ChevronRight,
@@ -21,18 +22,28 @@ import {
   Filter,
   ListTodo,
   ListChecks,
+  RefreshCw,
 } from 'lucide-vue-next';
 import TopBar from '../components/TopBar.vue';
 import ToastContainer from '../components/ToastContainer.vue';
 import { useCharacters } from '../composables/useCharacters';
 import { useToast } from '../composables/useToast';
 import { useBatchOperations } from '../composables/useBatchOperations';
-import type { Character, HandoverStatus, RiskLevel } from '../types';
-import { HANDOVER_LABELS, RISK_LABELS } from '../types';
+import { useInspectionTasks } from '../composables/useInspectionTasks';
+import type { Character, HandoverStatus, RiskLevel, InspectionTask, InspectionStatus } from '../types';
+import { HANDOVER_LABELS, RISK_LABELS, INSPECTION_SEVERITY_LABELS, INSPECTION_STATUS_LABELS } from '../types';
 
 const { characters, allStories, updateCharacter } = useCharacters();
+const router = useRouter();
 const { success, warning } = useToast();
 const { clearSelection } = useBatchOperations();
+const {
+  getUnresolvedTasksByCharacterId,
+  upsertHandoverBlockTask,
+  syncHandoverNoteToTask,
+  updateTask,
+  resolveTask,
+} = useInspectionTasks();
 
 const selectedStory = ref<string>('');
 const selectedOwner = ref<string>('');
@@ -79,6 +90,49 @@ function hasObjectiveRisk(char: Character): boolean {
   const isHighRisk = char.riskLevel === 'high' || char.riskLevel === 'critical';
   const noOwner = !char.owner;
   return hasMissingParts || isHighRisk || noOwner;
+}
+
+// ------- 巡检任务联动 -------
+const taskStatusColors: Record<InspectionStatus, string> = {
+  open: 'bg-blue-50 text-blue-700 border-blue-200',
+  in_progress: 'bg-yellow-50 text-yellow-700 border-yellow-200',
+  blocked: 'bg-red-50 text-red-700 border-red-200',
+  resolved: 'bg-bamboo-50 text-bamboo-700 border-bamboo-200',
+  dismissed: 'bg-gray-50 text-gray-500 border-gray-200',
+};
+
+function charUnresolvedTasks(charId: string): InspectionTask[] {
+  return getUnresolvedTasksByCharacterId(charId);
+}
+
+/** 客观风险角色尝试标记 confirmed 时拦截，并创建/更新交接来源巡检任务 */
+function interceptRiskyConfirm(char: Character) {
+  const { task, created } = upsertHandoverBlockTask(char);
+  warning(
+    `「${char.name}」存在缺件、高风险或未分配责任人，无法标记为可交接，已${created ? '生成' : '更新'}巡检任务「${task.title}」`
+  );
+}
+
+/** 把交接备注同步为关联交接任务的描述 */
+function handleSyncNoteToTask(char: Character) {
+  if (!char.handoverNote.trim()) {
+    warning(`「${char.name}」的交接备注为空，无可同步内容`);
+    return;
+  }
+  const task = syncHandoverNoteToTask(char);
+  if (task) {
+    success(`已将「${char.name}」的交接备注同步为任务「${task.title}」的描述`);
+  }
+}
+
+function handleResolveTask(task: InspectionTask) {
+  resolveTask(task.id);
+  success(`任务「${task.title}」已标记为解决`);
+}
+
+function quickTaskStatus(task: InspectionTask, status: InspectionStatus) {
+  updateTask(task.id, { status });
+  success(`任务「${task.title}」已更新为「${INSPECTION_STATUS_LABELS[status]}」`);
 }
 
 const handoverStats = computed(() => {
@@ -256,7 +310,7 @@ function cancelEdit() {
 
 function saveEdit(char: Character) {
   if (editHandoverStatus.value === 'confirmed' && hasObjectiveRisk(char)) {
-    warning('该角色存在缺件、高风险或未分配责任人，无法标记为可交接');
+    interceptRiskyConfirm(char);
     return;
   }
   updateCharacter(char.id, {
@@ -269,7 +323,7 @@ function saveEdit(char: Character) {
 
 function quickHandoverStatus(char: Character, status: HandoverStatus) {
   if (status === 'confirmed' && hasObjectiveRisk(char)) {
-    warning('该角色存在缺件、高风险或未分配责任人，无法标记为可交接');
+    interceptRiskyConfirm(char);
     return;
   }
   updateCharacter(char.id, { handoverStatus: status });
@@ -368,8 +422,17 @@ const preparationPercentage = computed(() => {
             演出前交接
           </span>
         </div>
-        <div class="text-xs sm:text-sm text-ink-500">
-          共 {{ allStories.length }} 个故事
+        <div class="flex items-center gap-2">
+          <button
+            class="btn-secondary !py-1.5 !px-2.5"
+            @click="router.push({ path: '/tasks', query: selectedStory ? { story: selectedStory } : {} })"
+          >
+            <ListTodo class="w-4 h-4" />
+            <span class="hidden sm:inline">巡检任务</span>
+          </button>
+          <div class="text-xs sm:text-sm text-ink-500">
+            共 {{ allStories.length }} 个故事
+          </div>
         </div>
       </div>
 
@@ -780,6 +843,56 @@ const preparationPercentage = computed(() => {
                             <AlertOctagon class="w-4 h-4 flex-shrink-0" />
                             <span>该角色存在客观风险（缺件/高风险/未分配责任人），不能标记为「可交接」</span>
                           </p>
+                        </div>
+
+                        <div
+                          v-if="hasObjectiveRisk(char)"
+                          class="p-3 rounded-md border border-rice-200 bg-rice-50/60 space-y-2"
+                          @click.stop
+                        >
+                          <div class="flex flex-wrap items-center gap-2">
+                            <ListTodo class="w-4 h-4 text-cinnabar-600" />
+                            <span class="text-xs sm:text-sm font-bold text-ink-700">
+                              关联巡检任务（未解决 {{ charUnresolvedTasks(char.id).length }}）
+                            </span>
+                            <button
+                              class="btn-secondary !py-0.5 !px-2 text-xs ml-auto"
+                              title="将交接备注写入关联交接任务的描述"
+                              @click.stop="handleSyncNoteToTask(char)"
+                            >
+                              <RefreshCw class="w-3 h-3" />
+                              同步交接备注为任务描述
+                            </button>
+                          </div>
+                          <div v-if="charUnresolvedTasks(char.id).length === 0" class="text-xs text-ink-400">
+                            暂无未解决任务，尝试标记「可交接」将自动生成交接风险任务
+                          </div>
+                          <div
+                            v-for="task in charUnresolvedTasks(char.id)"
+                            :key="task.id"
+                            class="flex flex-wrap items-center gap-2 text-xs"
+                          >
+                            <span :class="['tag border shrink-0', riskColors[task.severity]]">
+                              {{ INSPECTION_SEVERITY_LABELS[task.severity] }}
+                            </span>
+                            <span class="flex-1 min-w-0 truncate text-ink-700">{{ task.title }}</span>
+                            <span :class="['tag border shrink-0', taskStatusColors[task.status]]">
+                              {{ INSPECTION_STATUS_LABELS[task.status] }}
+                            </span>
+                            <button
+                              v-if="task.status === 'open' || task.status === 'blocked'"
+                              class="btn-secondary !py-0.5 !px-2 text-xs"
+                              @click.stop="quickTaskStatus(task, 'in_progress')"
+                            >
+                              开始处理
+                            </button>
+                            <button
+                              class="btn-secondary !py-0.5 !px-2 text-xs !bg-bamboo-50 !text-bamboo-700 !border-bamboo-200 hover:!bg-bamboo-100"
+                              @click.stop="handleResolveTask(task)"
+                            >
+                              解决
+                            </button>
+                          </div>
                         </div>
 
                         <div v-if="editingId !== char.id" class="flex flex-wrap gap-2 pt-2 border-t border-rice-100">

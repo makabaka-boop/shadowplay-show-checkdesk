@@ -1,7 +1,8 @@
 import { ref, computed, watch } from 'vue';
 import type { Character } from '../types';
-import { normalizeCharacter } from '../types';
+import { normalizeCharacter, reissueDuplicateIds } from '../types';
 import { mockCharacters } from '../data/mockData';
+import { blockTasksByCharacterIds } from './useInspectionTasks';
 
 const STORAGE_KEY = 'shadow-puppetry-characters';
 
@@ -85,6 +86,8 @@ export function useCharacters() {
     const index = characters.value.findIndex(c => c.id === id);
     if (index !== -1) {
       characters.value.splice(index, 1);
+      // 角色删除后，关联巡检任务不丢失，进入 blocked 并保留来源信息
+      blockTasksByCharacterIds([id]);
       return true;
     }
     return false;
@@ -123,28 +126,37 @@ export function useCharacters() {
     return JSON.stringify(characters.value, null, 2);
   }
 
+  /**
+   * 从数组恢复角色数据（备份包恢复用）：逐条 normalize，重复 id 自动重建。
+   */
+  function restoreCharacters(list: any[]): { count: number; invalidCount: number; reissuedCount: number } {
+    const normalized: Character[] = [];
+    let invalidCount = 0;
+    list.forEach((item) => {
+      if (!item || typeof item !== 'object') {
+        invalidCount++;
+        return;
+      }
+      try {
+        normalized.push(normalizeCharacter(item));
+      } catch {
+        invalidCount++;
+      }
+    });
+    const { items, reissued } = reissueDuplicateIds(normalized, 'char');
+    characters.value = items;
+    notifyImportListeners();
+    return { count: items.length, invalidCount, reissuedCount: reissued };
+  }
+
   function importData(jsonStr: string): { success: boolean; count: number; invalidCount: number } {
     try {
       const parsed = JSON.parse(jsonStr);
       if (!Array.isArray(parsed)) {
         return { success: false, count: 0, invalidCount: 0 };
       }
-      const normalized: Character[] = [];
-      let invalidCount = 0;
-      parsed.forEach((item) => {
-        if (!item || typeof item !== 'object') {
-          invalidCount++;
-          return;
-        }
-        try {
-          normalized.push(normalizeCharacter(item));
-        } catch {
-          invalidCount++;
-        }
-      });
-      characters.value = normalized;
-      notifyImportListeners();
-      return { success: true, count: normalized.length, invalidCount };
+      const result = restoreCharacters(parsed);
+      return { success: true, count: result.count, invalidCount: result.invalidCount };
     } catch {
       return { success: false, count: 0, invalidCount: 0 };
     }
@@ -161,5 +173,6 @@ export function useCharacters() {
     allOwners,
     exportData,
     importData,
+    restoreCharacters,
   };
 }

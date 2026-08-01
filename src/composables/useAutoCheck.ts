@@ -1,9 +1,11 @@
 import { computed } from 'vue';
 import type { CheckResult, Character } from '../types';
 import { useCharacters } from './useCharacters';
+import { useInspectionTasks } from './useInspectionTasks';
 
 export function useAutoCheck() {
   const { characters } = useCharacters();
+  const { getUnresolvedTasksByCharacterId } = useInspectionTasks();
 
   function hasMissingAccessories(char: Character): boolean {
     return char.missingAccessories.some(a => a.available < a.required);
@@ -116,6 +118,11 @@ export function useAutoCheck() {
     return allCheckResults.value.some(r => r.characterIds.includes(charId));
   }
 
+  /** 角色关联的未解决巡检任务数量（open / in_progress / blocked） */
+  function getUnresolvedTaskCount(charId: string): number {
+    return getUnresolvedTasksByCharacterId(charId).length;
+  }
+
   const hasAnyIssues = computed(() => allCheckResults.value.length > 0);
 
   const errorCount = computed(() =>
@@ -130,6 +137,7 @@ export function useAutoCheck() {
     allCheckResults,
     getCharacterIssues,
     characterHasIssues,
+    getUnresolvedTaskCount,
     hasAnyIssues,
     errorCount,
     warningCount,

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, computed } from 'vue';
 import { useRouter } from 'vue-router';
 import {
   Upload,
@@ -13,14 +13,17 @@ import {
   Home,
   ClipboardCheck,
   Theater,
+  ListTodo,
 } from 'lucide-vue-next';
 import { useCharacters } from '../composables/useCharacters';
 import { useAutoCheck } from '../composables/useAutoCheck';
 import { useDemoMode } from '../composables/useDemoMode';
 import { useToast } from '../composables/useToast';
 import { useBatchOperations } from '../composables/useBatchOperations';
-import type { CharacterStatus } from '../types';
-import { STATUS_LABELS, BATCH_STATUSES } from '../types';
+import { useInspectionTasks } from '../composables/useInspectionTasks';
+import { useRehearsalPlans } from '../composables/useRehearsalPlans';
+import type { CharacterStatus, BackupBundle } from '../types';
+import { STATUS_LABELS, BATCH_STATUSES, BACKUP_BUNDLE_VERSION } from '../types';
 
 const router = useRouter();
 
@@ -33,29 +36,80 @@ const emit = defineEmits<{
   (e: 'dataImported'): void;
 }>();
 
-const { exportData, importData, characters } = useCharacters();
+const { importData, characters, restoreCharacters } = useCharacters();
 const { errorCount, warningCount } = useAutoCheck();
 const { isDemoMode, toggleDemoMode } = useDemoMode();
 const { success, error, warning } = useToast();
 const { selectedIds, hasSelection, selectedCount, batchUpdateStatus, clearSelection } = useBatchOperations();
+const {
+  tasks: inspectionTasks,
+  restoreTasks,
+  validateTaskConsistency,
+} = useInspectionTasks();
+const { rehearsalPlans, restorePlans } = useRehearsalPlans();
+
+const openTaskCount = computed(() =>
+  inspectionTasks.value.filter(t => t.status === 'open' || t.status === 'in_progress' || t.status === 'blocked').length
+);
 
 const fileInputRef = ref<HTMLInputElement | null>(null);
 const showBatchMenu = ref(false);
 
-function handleExport() {
-  const json = exportData();
+function downloadJson(json: string, filename: string) {
   const blob = new Blob([json], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `皮影演出核对备份_${new Date().toISOString().slice(0, 10)}.json`;
+  a.download = filename;
   a.click();
   URL.revokeObjectURL(url);
-  success(`已保存 ${characters.value.length} 条角色核对记录`);
+}
+
+function handleExport() {
+  const bundle: BackupBundle = {
+    version: BACKUP_BUNDLE_VERSION,
+    exportedAt: new Date().toISOString(),
+    characters: characters.value,
+    rehearsalPlans: rehearsalPlans.value,
+    inspectionTasks: inspectionTasks.value,
+  };
+  downloadJson(JSON.stringify(bundle, null, 2), `皮影检查台备份包_${new Date().toISOString().slice(0, 10)}.json`);
+  success(
+    `已保存备份包：${characters.value.length} 个角色、${rehearsalPlans.value.length} 个排练计划、${inspectionTasks.value.length} 条巡检任务`
+  );
 }
 
 function triggerImport() {
   fileInputRef.value?.click();
+}
+
+/** 恢复检查台备份包（version 2）：三类数据分别 normalize 恢复，再做一致性校验 */
+function handleBundleImport(bundle: BackupBundle) {
+  const charResult = restoreCharacters(Array.isArray(bundle.characters) ? bundle.characters : []);
+  const planResult = restorePlans(Array.isArray(bundle.rehearsalPlans) ? bundle.rehearsalPlans : []);
+  const taskResult = restoreTasks(Array.isArray(bundle.inspectionTasks) ? bundle.inspectionTasks : []);
+
+  const validCharacterIds = new Set(characters.value.map(c => c.id));
+  const validPlanIds = new Set(rehearsalPlans.value.map(p => p.id));
+  const blockedCount = validateTaskConsistency(validCharacterIds, validPlanIds);
+
+  const reissuedCount = charResult.reissuedCount + planResult.reissuedCount + taskResult.reissuedCount;
+  const invalidCount = charResult.invalidCount + planResult.invalidCount + taskResult.invalidCount;
+
+  clearSelection();
+  emit('dataImported');
+  success(
+    `已恢复备份包：${charResult.count} 个角色、${planResult.count} 个排练计划、${taskResult.count} 条巡检任务`
+  );
+  if (reissuedCount > 0) {
+    warning(`${reissuedCount} 条记录存在重复 id，已自动重建`);
+  }
+  if (blockedCount > 0) {
+    warning(`${blockedCount} 条任务因关联角色或排练计划不存在进入阻塞`);
+  }
+  if (invalidCount > 0) {
+    warning(`另有 ${invalidCount} 条记录格式异常已跳过`);
+  }
 }
 
 function handleFileChange(event: Event) {
@@ -66,6 +120,19 @@ function handleFileChange(event: Event) {
   const reader = new FileReader();
   reader.onload = (e) => {
     const content = e.target?.result as string;
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      error('载入失败：文件格式不正确或内容损坏');
+      return;
+    }
+    // 检查台备份包（version 2）：一次恢复角色、排练计划、巡检任务
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && parsed.version === BACKUP_BUNDLE_VERSION) {
+      handleBundleImport(parsed as BackupBundle);
+      return;
+    }
+    // 兼容旧版纯角色数组备份
     const result = importData(content);
     if (result.success) {
       if (result.invalidCount > 0) {
@@ -168,6 +235,26 @@ function handleBatchStatus(status: CharacterStatus) {
             <Theater class="w-4 h-4" />
             <span class="hidden sm:inline">排练计划</span>
             <span class="sm:hidden">排练</span>
+          </button>
+
+          <button
+            :class="[
+              'inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-all relative',
+              router.currentRoute.value.name === 'inspection-tasks'
+                ? 'bg-white/20 text-white'
+                : 'bg-white/10 text-rice-100 hover:bg-white/20'
+            ]"
+            @click="router.push('/tasks')"
+          >
+            <ListTodo class="w-4 h-4" />
+            <span class="hidden sm:inline">巡检任务</span>
+            <span class="sm:hidden">任务</span>
+            <span
+              v-if="openTaskCount > 0"
+              class="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] px-1 rounded-full bg-gold-500 text-white text-[10px] font-bold flex items-center justify-center shadow"
+            >
+              {{ openTaskCount }}
+            </span>
           </button>
 
           <div class="flex items-center gap-2 mx-2 bg-white/10 rounded-md px-3 py-1.5">

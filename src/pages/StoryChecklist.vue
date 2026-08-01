@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from 'vue';
+import { ref, computed, watch, onMounted, reactive } from 'vue';
+import { useRouter } from 'vue-router';
 import {
   ChevronLeft,
   ChevronRight,
@@ -18,6 +19,10 @@ import {
   AlertOctagon,
   ChevronDown,
   ChevronUp,
+  ListTodo,
+  ExternalLink,
+  Plus,
+  RefreshCw,
 } from 'lucide-vue-next';
 import TopBar from '../components/TopBar.vue';
 import ToastContainer from '../components/ToastContainer.vue';
@@ -26,13 +31,24 @@ import { useCharacters } from '../composables/useCharacters';
 import { useToast } from '../composables/useToast';
 import { useAutoCheck } from '../composables/useAutoCheck';
 import { useBatchOperations } from '../composables/useBatchOperations';
-import type { Character, CharacterStatus, RiskLevel } from '../types';
-import { STATUS_LABELS, RISK_LABELS } from '../types';
+import { useInspectionTasks } from '../composables/useInspectionTasks';
+import type { Character, CharacterStatus, RiskLevel, InspectionTask, InspectionSeverity, InspectionStatus } from '../types';
+import { STATUS_LABELS, RISK_LABELS, INSPECTION_SEVERITY_LABELS, INSPECTION_STATUS_LABELS } from '../types';
 
+const router = useRouter();
 const { characters, allStories, updateCharacter, getCharacterById } = useCharacters();
 const { success, warning } = useToast();
-const { hasMissingAccessories } = useAutoCheck();
+const { hasMissingAccessories, getUnresolvedTaskCount } = useAutoCheck();
 const { clearSelection } = useBatchOperations();
+const {
+  getTasksByStory,
+  getUnresolvedTasksByCharacterId,
+  getResolvableMissingPartTasks,
+  createAutoTasksForCharacter,
+  addTask,
+  updateTask,
+  resolveTask,
+} = useInspectionTasks();
 
 const showModal = ref(false);
 const editingCharacter = ref<Character | null>(null);
@@ -96,6 +112,133 @@ const incompleteCount = computed(() => {
   return storyCharacters.value.filter(c => c.status !== 'completed' && c.status !== 'ready_to_pack').length;
 });
 
+// ------- 巡检待办工作区 -------
+const storyTasks = computed(() => {
+  if (!selectedStory.value) return [];
+  return getTasksByStory(selectedStory.value);
+});
+
+const storyTaskStats = computed(() => ({
+  open: storyTasks.value.filter(t => t.status === 'open').length,
+  in_progress: storyTasks.value.filter(t => t.status === 'in_progress').length,
+  blocked: storyTasks.value.filter(t => t.status === 'blocked').length,
+}));
+
+const taskStatusOrder: Record<InspectionStatus, number> = {
+  open: 0,
+  in_progress: 1,
+  blocked: 2,
+  resolved: 3,
+  dismissed: 4,
+};
+const taskSeverityOrder: Record<InspectionSeverity, number> = {
+  critical: 0,
+  high: 1,
+  medium: 2,
+  low: 3,
+};
+
+const storyTodoTasks = computed(() => {
+  return storyTasks.value
+    .filter(t => t.status === 'open' || t.status === 'in_progress' || t.status === 'blocked')
+    .sort((a, b) => {
+      const s = taskStatusOrder[a.status] - taskStatusOrder[b.status];
+      if (s !== 0) return s;
+      return taskSeverityOrder[a.severity] - taskSeverityOrder[b.severity];
+    })
+    .slice(0, 5);
+});
+
+const taskStatusColors: Record<InspectionStatus, string> = {
+  open: 'bg-blue-50 text-blue-700 border-blue-200',
+  in_progress: 'bg-yellow-50 text-yellow-700 border-yellow-200',
+  blocked: 'bg-red-50 text-red-700 border-red-200',
+  resolved: 'bg-bamboo-50 text-bamboo-700 border-bamboo-200',
+  dismissed: 'bg-gray-50 text-gray-500 border-gray-200',
+};
+
+function charUnresolvedTasks(charId: string): InspectionTask[] {
+  return getUnresolvedTasksByCharacterId(charId);
+}
+
+// 角色从 need_parts 改为 ready_to_pack 时的补件任务解决建议（仅建议，不自动关闭）
+const resolveSuggestions = ref<Record<string, InspectionTask[]>>({});
+
+function maybeSuggestResolveMissingParts(char: Character, oldStatus: CharacterStatus, newStatus: CharacterStatus) {
+  if (oldStatus !== 'need_parts' || newStatus !== 'ready_to_pack') return;
+  const candidates = getResolvableMissingPartTasks(char);
+  if (candidates.length > 0) {
+    resolveSuggestions.value = { ...resolveSuggestions.value, [char.id]: candidates };
+  }
+}
+
+function clearSuggestion(charId: string) {
+  const rest = { ...resolveSuggestions.value };
+  delete rest[charId];
+  resolveSuggestions.value = rest;
+}
+
+function resolveAllSuggested(charId: string) {
+  const list = resolveSuggestions.value[charId] || [];
+  list.forEach(t => resolveTask(t.id));
+  clearSuggestion(charId);
+  success(`已解决 ${list.length} 条补件任务`);
+}
+
+function handleResolveTask(task: InspectionTask) {
+  resolveTask(task.id);
+  if (resolveSuggestions.value[task.characterId]?.some(t => t.id === task.id)) {
+    const remain = resolveSuggestions.value[task.characterId].filter(t => t.id !== task.id);
+    if (remain.length > 0) {
+      resolveSuggestions.value = { ...resolveSuggestions.value, [task.characterId]: remain };
+    } else {
+      clearSuggestion(task.characterId);
+    }
+  }
+  success(`任务「${task.title}」已标记为解决`);
+}
+
+function quickTaskStatus(task: InspectionTask, status: InspectionStatus) {
+  updateTask(task.id, { status });
+  success(`任务「${task.title}」已更新为「${INSPECTION_STATUS_LABELS[status]}」`);
+}
+
+const newTaskTitles = reactive<Record<string, string>>({});
+const newTaskSeverities = reactive<Record<string, InspectionSeverity>>({});
+
+function createManualTask(char: Character) {
+  const title = (newTaskTitles[char.id] || '').trim();
+  if (!title) {
+    warning('请填写任务标题');
+    return;
+  }
+  addTask({
+    sourceType: 'manual',
+    sourceId: '',
+    story: char.story,
+    characterId: char.id,
+    planId: '',
+    title,
+    description: '',
+    severity: newTaskSeverities[char.id] || 'medium',
+    status: 'open',
+    assignee: char.owner,
+    dueAt: '',
+    resolvedAt: '',
+  });
+  newTaskTitles[char.id] = '';
+  success(`已为「${char.name}」创建巡检任务`);
+}
+
+function syncCharAutoTasks(char: Character) {
+  const created = createAutoTasksForCharacter(char);
+  if (created > 0) {
+    success(`已为「${char.name}」生成 ${created} 条风险任务`);
+  } else {
+    success(`「${char.name}」的风险任务已是最新`);
+  }
+}
+
 const completionPercentage = computed(() => {
   const total = storyStats.value.total;
   if (total === 0) return 0;
@@ -151,16 +294,20 @@ function cancelEdit() {
 }
 
 function saveEdit(char: Character) {
+  const oldStatus = char.status;
   updateCharacter(char.id, {
     status: editStatus.value,
     repairNote: editRepairNote.value,
   });
+  maybeSuggestResolveMissingParts(char, oldStatus, editStatus.value);
   success(`已更新「${char.name}」的状态和备注`);
   editingId.value = null;
 }
 
 function quickStatus(char: Character, status: CharacterStatus) {
+  const oldStatus = char.status;
   updateCharacter(char.id, { status });
+  maybeSuggestResolveMissingParts(char, oldStatus, status);
   success(`「${char.name}」已标记为「${STATUS_LABELS[status]}」`);
 }
 
@@ -337,6 +484,55 @@ function handleSaved() {
             </div>
           </div>
 
+          <div class="scroll-card p-4 !bg-gradient-to-br !from-rice-50 !to-rice-100/60 border-l-4 !border-l-cinnabar-400">
+            <div class="flex flex-wrap items-center gap-2 mb-3">
+              <ListTodo class="w-5 h-5 text-cinnabar-600" />
+              <h4 class="font-bold text-ink-800">巡检待办</h4>
+              <span class="tag border bg-blue-50 text-blue-700 border-blue-200">待处理 {{ storyTaskStats.open }}</span>
+              <span class="tag border bg-yellow-50 text-yellow-700 border-yellow-200">处理中 {{ storyTaskStats.in_progress }}</span>
+              <span class="tag border bg-red-50 text-red-700 border-red-200">已阻塞 {{ storyTaskStats.blocked }}</span>
+              <button
+                class="btn-secondary !py-1 !px-2.5 text-xs ml-auto"
+                @click="router.push({ path: '/tasks', query: { story: selectedStory } })"
+              >
+                <ExternalLink class="w-3.5 h-3.5" />
+                前往任务中心
+              </button>
+            </div>
+            <div v-if="storyTodoTasks.length === 0" class="text-sm text-ink-400 text-center py-3">
+              该故事暂无未解决巡检任务
+            </div>
+            <div v-else class="space-y-2">
+              <div
+                v-for="task in storyTodoTasks"
+                :key="task.id"
+                class="flex flex-wrap items-center gap-2 p-2 rounded-md border bg-white/70 border-rice-200"
+              >
+                <span :class="['tag border shrink-0', riskColors[task.severity]]">
+                  {{ INSPECTION_SEVERITY_LABELS[task.severity] }}
+                </span>
+                <span class="text-xs sm:text-sm font-medium text-ink-800 flex-1 min-w-0 truncate">{{ task.title }}</span>
+                <span class="text-xs text-ink-500 shrink-0">{{ task.assignee || '未分配' }}</span>
+                <span :class="['tag border shrink-0', taskStatusColors[task.status]]">
+                  {{ INSPECTION_STATUS_LABELS[task.status] }}
+                </span>
+                <button
+                  v-if="task.status === 'open' || task.status === 'blocked'"
+                  class="btn-secondary !py-0.5 !px-2 text-xs"
+                  @click="quickTaskStatus(task, 'in_progress')"
+                >
+                  开始处理
+                </button>
+                <button
+                  class="btn-secondary !py-0.5 !px-2 text-xs !bg-bamboo-50 !text-bamboo-700 !border-bamboo-200 hover:!bg-bamboo-100"
+                  @click="handleResolveTask(task)"
+                >
+                  标记解决
+                </button>
+              </div>
+            </div>
+          </div>
+
           <div class="flex flex-wrap items-center gap-2 sm:gap-3 pt-1">
             <div class="flex items-center gap-1.5 text-sm text-ink-600">
               <Filter class="w-4 h-4" />
@@ -433,6 +629,13 @@ function handleSaved() {
                         <component :is="riskIconMap[char.riskLevel]" class="w-3 h-3" />
                         {{ RISK_LABELS[char.riskLevel] }}
                       </span>
+                      <span
+                        v-if="filterMode === 'risk' || getUnresolvedTaskCount(char.id) > 0"
+                        class="tag border bg-blue-50 text-blue-700 border-blue-200 shrink-0"
+                      >
+                        <ListTodo class="w-3 h-3 mr-1" />
+                        未解决任务 {{ getUnresolvedTaskCount(char.id) }}
+                      </span>
                     </div>
 
                     <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 sm:gap-4 mb-2">
@@ -474,6 +677,118 @@ function handleSaved() {
                         <AlertTriangle v-else-if="reminder.includes('修备')" class="w-4 h-4 flex-shrink-0 mt-0.5" />
                         <AlertCircle v-else class="w-4 h-4 flex-shrink-0 mt-0.5" />
                         <span>{{ reminder }}</span>
+                      </div>
+
+                      <div
+                        v-if="resolveSuggestions[char.id]?.length"
+                        class="p-3 rounded-md border bg-emerald-50 border-emerald-200"
+                        @click.stop
+                      >
+                        <p class="text-xs sm:text-sm text-emerald-700 flex items-start gap-1.5 mb-2">
+                          <Check class="w-4 h-4 flex-shrink-0 mt-0.5" />
+                          <span>
+                            角色已改为「可封箱」，检测到 {{ resolveSuggestions[char.id].length }} 条相关补件任务，建议标记为解决（手工创建的任务不会自动关闭）
+                          </span>
+                        </p>
+                        <div class="space-y-1 mb-2">
+                          <div
+                            v-for="task in resolveSuggestions[char.id]"
+                            :key="task.id"
+                            class="flex items-center gap-2 text-xs text-emerald-800"
+                          >
+                            <ListTodo class="w-3.5 h-3.5 flex-shrink-0" />
+                            <span class="flex-1 min-w-0 truncate">{{ task.title }}</span>
+                            <button
+                              class="btn-secondary !py-0.5 !px-2 text-xs !bg-bamboo-50 !text-bamboo-700 !border-bamboo-200 hover:!bg-bamboo-100"
+                              @click.stop="handleResolveTask(task)"
+                            >
+                              标记解决
+                            </button>
+                          </div>
+                        </div>
+                        <div class="flex gap-2">
+                          <button
+                            class="btn-secondary !py-1 !px-2.5 text-xs !bg-emerald-100 !text-emerald-700 !border-emerald-200 hover:!bg-emerald-200"
+                            @click.stop="resolveAllSuggested(char.id)"
+                          >
+                            <Check class="w-3.5 h-3.5" />
+                            全部解决
+                          </button>
+                          <button
+                            class="btn-secondary !py-1 !px-2.5 text-xs"
+                            @click.stop="clearSuggestion(char.id)"
+                          >
+                            <X class="w-3.5 h-3.5" />
+                            忽略
+                          </button>
+                        </div>
+                      </div>
+
+                      <div class="p-3 rounded-md border border-rice-200 bg-rice-50/60 space-y-2" @click.stop>
+                        <div class="flex flex-wrap items-center gap-2">
+                          <ListTodo class="w-4 h-4 text-cinnabar-600" />
+                          <span class="text-xs sm:text-sm font-bold text-ink-700">
+                            巡检任务（未解决 {{ getUnresolvedTaskCount(char.id) }}）
+                          </span>
+                          <button
+                            class="btn-secondary !py-0.5 !px-2 text-xs ml-auto"
+                            title="按统一规则补齐缺件/高风险/未分配责任人任务"
+                            @click.stop="syncCharAutoTasks(char)"
+                          >
+                            <RefreshCw class="w-3 h-3" />
+                            同步风险任务
+                          </button>
+                        </div>
+                        <div v-if="charUnresolvedTasks(char.id).length === 0" class="text-xs text-ink-400">
+                          暂无未解决任务
+                        </div>
+                        <div
+                          v-for="task in charUnresolvedTasks(char.id)"
+                          :key="task.id"
+                          class="flex flex-wrap items-center gap-2 text-xs"
+                        >
+                          <span :class="['tag border shrink-0', riskColors[task.severity]]">
+                            {{ INSPECTION_SEVERITY_LABELS[task.severity] }}
+                          </span>
+                          <span class="flex-1 min-w-0 truncate text-ink-700">{{ task.title }}</span>
+                          <span :class="['tag border shrink-0', taskStatusColors[task.status]]">
+                            {{ INSPECTION_STATUS_LABELS[task.status] }}
+                          </span>
+                          <button
+                            v-if="task.status === 'open' || task.status === 'blocked'"
+                            class="btn-secondary !py-0.5 !px-2 text-xs"
+                            @click.stop="quickTaskStatus(task, 'in_progress')"
+                          >
+                            开始处理
+                          </button>
+                          <button
+                            class="btn-secondary !py-0.5 !px-2 text-xs !bg-bamboo-50 !text-bamboo-700 !border-bamboo-200 hover:!bg-bamboo-100"
+                            @click.stop="handleResolveTask(task)"
+                          >
+                            解决
+                          </button>
+                        </div>
+                        <div class="flex flex-wrap items-center gap-2 pt-1 border-t border-rice-100">
+                          <input
+                            v-model="newTaskTitles[char.id]"
+                            class="input-base !py-1 text-xs flex-1 min-w-[160px]"
+                            placeholder="为该角色新建巡检任务..."
+                            @click.stop
+                            @keyup.enter="createManualTask(char)"
+                          />
+                          <select v-model="newTaskSeverities[char.id]" class="select-base !w-auto !py-1 text-xs">
+                            <option v-for="(label, key) in INSPECTION_SEVERITY_LABELS" :key="key" :value="key">
+                              {{ label }}
+                            </option>
+                          </select>
+                          <button
+                            class="btn-secondary !py-1 !px-2.5 text-xs"
+                            @click.stop="createManualTask(char)"
+                          >
+                            <Plus class="w-3.5 h-3.5" />
+                            创建
+                          </button>
+                        </div>
                       </div>
 
                       <div v-if="editingId !== char.id" class="flex flex-wrap gap-2 pt-2 border-t border-rice-100">

@@ -1,7 +1,8 @@
 import { ref, computed, watch } from 'vue';
 import type { RehearsalPlan, RehearsalCharacter, RehearsalStatus, RehearsalResult, Character } from '../types';
-import { normalizeRehearsalPlan } from '../types';
+import { normalizeRehearsalPlan, reissueDuplicateIds } from '../types';
 import { useCharacters } from './useCharacters';
+import { blockTasksByPlanCleanup } from './useInspectionTasks';
 
 const STORAGE_KEY = 'shadow-puppetry-rehearsal-plans';
 
@@ -96,13 +97,18 @@ export function useRehearsalPlans() {
     const validIds = new Set(characters.value.map(c => c.id));
     let changed = false;
     rehearsalPlans.value.forEach((plan, idx) => {
-      const valid = plan.characters.filter(c => validIds.has(c.characterId));
-      if (valid.length !== plan.characters.length) {
+      const removedIds = plan.characters
+        .filter(c => !validIds.has(c.characterId))
+        .map(c => c.characterId);
+      if (removedIds.length > 0) {
+        const valid = plan.characters.filter(c => validIds.has(c.characterId));
         rehearsalPlans.value[idx] = normalizeRehearsalPlan({
           ...plan,
           characters: valid,
           updatedAt: new Date().toISOString(),
         });
+        // 计划清理无效角色时，关联巡检任务不丢失，进入 blocked 并保留来源信息
+        blockTasksByPlanCleanup(plan.id, removedIds);
         changed = true;
       }
     });
@@ -160,6 +166,28 @@ export function useRehearsalPlans() {
     return rehearsalPlans.value.find(p => p.id === id);
   }
 
+  /**
+   * 从数组恢复排练计划（备份包恢复用）：逐条 normalize，重复 id 自动重建。
+   */
+  function restorePlans(list: any[]): { count: number; invalidCount: number; reissuedCount: number } {
+    const normalized: RehearsalPlan[] = [];
+    let invalidCount = 0;
+    list.forEach((item) => {
+      if (!item || typeof item !== 'object') {
+        invalidCount++;
+        return;
+      }
+      try {
+        normalized.push(normalizeRehearsalPlan(item));
+      } catch {
+        invalidCount++;
+      }
+    });
+    const { items, reissued } = reissueDuplicateIds(normalized, 'rh');
+    rehearsalPlans.value = items;
+    return { count: items.length, invalidCount, reissuedCount: reissued };
+  }
+
   function addCharacterToPlan(planId: string, characterId: string, order?: number) {
     const plan = getPlanById(planId);
     if (!plan) return null;
@@ -189,9 +217,12 @@ export function useRehearsalPlans() {
     const plan = getPlanById(planId);
     if (!plan) return null;
 
-    return updatePlan(planId, {
+    const updated = updatePlan(planId, {
       characters: plan.characters.filter(c => c.characterId !== characterId),
     });
+    // 计划移除角色时，关联巡检任务进入 blocked，描述追加「角色已从排练计划移除」
+    blockTasksByPlanCleanup(planId, [characterId]);
+    return updated;
   }
 
   function updateCharacterResult(
@@ -265,6 +296,7 @@ export function useRehearsalPlans() {
     updatePlan,
     deletePlan,
     getPlanById,
+    restorePlans,
     addCharacterToPlan,
     removeCharacterFromPlan,
     updateCharacterResult,

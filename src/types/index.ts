@@ -144,6 +144,112 @@ export const HANDOVER_LABELS: Record<HandoverStatus, string> = {
   has_risk: '存在风险',
 };
 
+export type InspectionSourceType = 'character' | 'handover' | 'rehearsal' | 'manual';
+
+export type InspectionSeverity = 'low' | 'medium' | 'high' | 'critical';
+
+export type InspectionStatus = 'open' | 'in_progress' | 'blocked' | 'resolved' | 'dismissed';
+
+export interface InspectionTask {
+  id: string;
+  sourceType: InspectionSourceType;
+  sourceId: string;
+  story: string;
+  characterId: string;
+  planId: string;
+  title: string;
+  description: string;
+  severity: InspectionSeverity;
+  status: InspectionStatus;
+  assignee: string;
+  dueAt: string;
+  resolvedAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export const INSPECTION_SOURCE_LABELS: Record<InspectionSourceType, string> = {
+  character: '角色清单',
+  handover: '交接核对',
+  rehearsal: '排练计划',
+  manual: '手工创建',
+};
+
+export const INSPECTION_SEVERITY_LABELS: Record<InspectionSeverity, string> = {
+  low: '低',
+  medium: '中',
+  high: '高',
+  critical: '紧急',
+};
+
+export const INSPECTION_STATUS_LABELS: Record<InspectionStatus, string> = {
+  open: '待处理',
+  in_progress: '处理中',
+  blocked: '已阻塞',
+  resolved: '已解决',
+  dismissed: '已忽略',
+};
+
+/** 检查台备份包：一次导出角色、排练计划、巡检任务三类数据 */
+export interface BackupBundle {
+  version: 2;
+  exportedAt: string;
+  characters: any[];
+  rehearsalPlans: any[];
+  inspectionTasks: any[];
+}
+
+export const BACKUP_BUNDLE_VERSION = 2;
+
+/** 恢复数据时重建重复 id，返回重建后的列表与重建数量 */
+export function reissueDuplicateIds<T extends { id: string }>(items: T[], prefix: string): { items: T[]; reissued: number } {
+  const seen = new Set<string>();
+  let reissued = 0;
+  const result = items.map(item => {
+    if (seen.has(item.id)) {
+      reissued++;
+      return { ...item, id: `${prefix}_` + Date.now().toString(36) + Math.random().toString(36).slice(2, 8) };
+    }
+    seen.add(item.id);
+    return item;
+  });
+  return { items: result, reissued };
+}
+
+export function normalizeInspectionTask(raw: any): InspectionTask {
+  const sourceTypes: InspectionSourceType[] = ['character', 'handover', 'rehearsal', 'manual'];
+  const severities: InspectionSeverity[] = ['low', 'medium', 'high', 'critical'];
+  const statuses: InspectionStatus[] = ['open', 'in_progress', 'blocked', 'resolved', 'dismissed'];
+
+  const now = new Date().toISOString();
+  const safeStr = (v: any, fallback = ''): string =>
+    typeof v === 'string' ? v : v != null ? String(v) : fallback;
+
+  const sourceType = safeStr(raw?.sourceType, 'manual');
+  const severity = safeStr(raw?.severity, 'medium');
+  const status = safeStr(raw?.status, 'open');
+  const finalStatus = statuses.includes(status as InspectionStatus) ? (status as InspectionStatus) : 'open';
+  const resolvedAt = safeStr(raw?.resolvedAt, '');
+
+  return {
+    id: safeStr(raw?.id, 'task_' + Math.random().toString(36).slice(2, 12)),
+    sourceType: sourceTypes.includes(sourceType as InspectionSourceType) ? (sourceType as InspectionSourceType) : 'manual',
+    sourceId: safeStr(raw?.sourceId, ''),
+    story: safeStr(raw?.story, '未分类'),
+    characterId: safeStr(raw?.characterId, ''),
+    planId: safeStr(raw?.planId, ''),
+    title: safeStr(raw?.title, '未命名任务'),
+    description: safeStr(raw?.description, ''),
+    severity: severities.includes(severity as InspectionSeverity) ? (severity as InspectionSeverity) : 'medium',
+    status: finalStatus,
+    assignee: safeStr(raw?.assignee, ''),
+    dueAt: safeStr(raw?.dueAt, ''),
+    resolvedAt: finalStatus === 'resolved' ? (resolvedAt || now) : resolvedAt,
+    createdAt: safeStr(raw?.createdAt, now),
+    updatedAt: safeStr(raw?.updatedAt, now),
+  };
+}
+
 export type RehearsalStatus = 'draft' | 'scheduled' | 'in_progress' | 'completed' | 'cancelled';
 
 export type RehearsalResult = 'not_started' | 'pass' | 'fail' | 'need_rehearse';
