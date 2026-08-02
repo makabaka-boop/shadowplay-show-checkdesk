@@ -1,4 +1,4 @@
-import type { Character } from '../types';
+import type { Character, InspectionTask } from '../types';
 
 const now = new Date().toISOString();
 
@@ -263,3 +263,97 @@ export const mockCharacters: Character[] = [
     updatedAt: now,
   },
 ];
+
+export function generateMockInspectionTasks(): InspectionTask[] {
+  const nowDate = new Date();
+  const inDays = (days: number) => new Date(nowDate.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
+  const created = inDays(-1);
+
+  return [
+    {
+      id: 'task_mock_001',
+      sourceType: 'handover',
+      sourceId: 'char_demo_001',
+      story: '三打白骨精',
+      characterId: 'char_demo_001',
+      planId: '',
+      title: '补齐孙悟空的金箍棒',
+      description: '交接核对发现金箍棒缺口 1 件，演出前 1 小时必须到位并加固连接处',
+      severity: 'high',
+      status: 'in_progress',
+      assignee: '张师傅',
+      dueAt: inDays(1),
+      resolvedAt: '',
+      createdAt: created,
+      updatedAt: created,
+    },
+    {
+      id: 'task_mock_002',
+      sourceType: 'rehearsal',
+      sourceId: 'rh_sample_002',
+      story: '木兰从军',
+      characterId: 'char_demo_009',
+      planId: 'rh_sample_002',
+      title: '复排单于的关节操作配合',
+      description: '排练计划「木兰从军 - 角色动作排练」中单于标记为需复排：关节操作配合需加强，建议安排助手双人操作',
+      severity: 'high',
+      status: 'open',
+      assignee: '李导演',
+      dueAt: inDays(2),
+      resolvedAt: '',
+      createdAt: created,
+      updatedAt: created,
+    },
+    {
+      id: 'task_mock_003',
+      sourceType: 'manual',
+      sourceId: '',
+      story: '三打白骨精',
+      characterId: '',
+      planId: '',
+      title: '演出前检查幕布与灯光设备',
+      description: '手工登记的巡检事项：开演前 30 分钟确认幕布平整、灯光角度覆盖白骨精变身区域',
+      severity: 'medium',
+      status: 'open',
+      assignee: '王师傅',
+      dueAt: inDays(1),
+      resolvedAt: '',
+      createdAt: created,
+      updatedAt: created,
+    },
+    {
+      id: 'task_mock_004',
+      sourceType: 'character',
+      sourceId: 'char_demo_012',
+      story: '木兰从军',
+      characterId: 'char_demo_012',
+      planId: '',
+      title: '补齐皇帝的龙袍',
+      description: '角色清单检查发现龙袍缺口 1 件',
+      severity: 'medium',
+      status: 'resolved',
+      assignee: '郑师傅',
+      dueAt: inDays(-1),
+      resolvedAt: inDays(-0.5),
+      createdAt: inDays(-2),
+      updatedAt: inDays(-0.5),
+    },
+    {
+      id: 'task_mock_005',
+      sourceType: 'character',
+      sourceId: 'char_removed_001',
+      story: '三打白骨精',
+      characterId: 'char_removed_001',
+      planId: '',
+      title: '补齐村姑的竹篮',
+      description: '来源角色已从角色清单删除，任务保留来源信息并进入阻塞，待人工确认处理方式',
+      severity: 'low',
+      status: 'blocked',
+      assignee: '',
+      dueAt: '',
+      resolvedAt: '',
+      createdAt: inDays(-3),
+      updatedAt: inDays(-1),
+    },
+  ];
+}

@@ -31,6 +31,7 @@ import {
   Users,
   ArrowRight,
   Wrench,
+  ListTodo,
 } from 'lucide-vue-next';
 import TopBar from '../components/TopBar.vue';
 import ToastContainer from '../components/ToastContainer.vue';
@@ -39,6 +40,7 @@ import { useRehearsalPlans } from '../composables/useRehearsalPlans';
 import { useCharacters } from '../composables/useCharacters';
 import { useToast } from '../composables/useToast';
 import { useBatchOperations } from '../composables/useBatchOperations';
+import { useInspectionTasks } from '../composables/useInspectionTasks';
 import type {
   RehearsalPlan,
   RehearsalStatus,
@@ -48,6 +50,7 @@ import type {
   RiskLevel,
   HandoverStatus,
   AccessoryGap,
+  InspectionSeverity,
 } from '../types';
 import {
   REHEARSAL_STATUS_LABELS,
@@ -55,6 +58,7 @@ import {
   RISK_LABELS,
   HANDOVER_LABELS,
   STATUS_LABELS,
+  INSPECTION_SEVERITY_LABELS,
 } from '../types';
 
 const route = useRoute();
@@ -72,10 +76,44 @@ const {
 const { characters, allStories } = useCharacters();
 const { success, warning, error } = useToast();
 const { clearSelection } = useBatchOperations();
+const {
+  getTasksByPlanId,
+  getUnresolvedTasksByCharacterId,
+  syncTaskFromRehearsalResult,
+} = useInspectionTasks();
 
 const planId = computed(() => route.params.id as string);
 const plan = computed<RehearsalPlan | undefined>(() => getPlanById(planId.value));
 const planStats = computed(() => plan.value ? getPlanStats(plan.value) : null);
+
+// ------- 巡检任务闭环 -------
+const unresolvedPlanTasks = computed(() => {
+  if (!plan.value) return [];
+  return getTasksByPlanId(plan.value.id).filter(
+    t => t.status === 'open' || t.status === 'in_progress' || t.status === 'blocked'
+  );
+});
+
+const planHighestSeverity = computed<InspectionSeverity | null>(() => {
+  const order: InspectionSeverity[] = ['critical', 'high', 'medium', 'low'];
+  for (const sev of order) {
+    if (unresolvedPlanTasks.value.some(t => t.severity === sev)) return sev;
+  }
+  return null;
+});
+
+function charUnresolvedTaskCount(characterId: string): number {
+  return getUnresolvedTasksByCharacterId(characterId).length;
+}
+
+/** 排练结果保存后闭环：fail/need_rehearse 时按统一规则补缺生成巡检任务，不覆盖已有任务 */
+function afterResultSaved(characterId: string) {
+  if (!plan.value) return;
+  const { task, created } = syncTaskFromRehearsalResult(plan.value, characterId);
+  if (created && task) {
+    success(`已生成巡检任务「${task.title}」`);
+  }
+}
 
 const showModal = ref(false);
 const showAddCharacter = ref(false);
@@ -268,13 +306,15 @@ function cancelEdit() {
 
 function saveEdit() {
   if (!editingCharacterId.value || !plan.value) return;
-  updateCharacterResult(plan.value.id, editingCharacterId.value, {
+  const characterId = editingCharacterId.value;
+  updateCharacterResult(plan.value.id, characterId, {
     rehearsalResult: editResultForm.result,
     rehearsalNote: editResultForm.note,
     checkedBy: editResultForm.checkedBy,
   });
   success('已更新排练结果');
   editingCharacterId.value = null;
+  afterResultSaved(characterId);
 }
 
 function quickSetResult(rc: RehearsalCharacter, result: RehearsalResult) {
@@ -283,6 +323,7 @@ function quickSetResult(rc: RehearsalCharacter, result: RehearsalResult) {
     rehearsalResult: result,
   });
   success(`已标记为「${REHEARSAL_RESULT_LABELS[result]}」`);
+  afterResultSaved(rc.characterId);
 }
 
 function addCharacter(characterId: string) {
@@ -398,6 +439,10 @@ const riskIconMap = {
               {{ label }}
             </option>
           </select>
+          <button class="btn-secondary !py-1.5" @click="router.push({ path: '/tasks', query: { planId: plan.id } })">
+            <ListTodo class="w-4 h-4" />
+            <span class="hidden sm:inline">巡检任务</span>
+          </button>
           <button class="btn-secondary !py-1.5" @click="openEdit">
             <Edit3 class="w-4 h-4" />
             <span class="hidden sm:inline">编辑场次</span>
@@ -445,7 +490,7 @@ const riskIconMap = {
           </div>
         </div>
 
-        <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2 sm:gap-3 pt-4 border-t border-rice-200">
+        <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2 sm:gap-3 pt-4 border-t border-rice-200">
           <div class="bg-gradient-to-br from-ink-50 to-ink-100/50 rounded-lg p-3 border border-ink-200">
             <div class="flex items-center gap-1.5 mb-1">
               <Users class="w-3.5 h-3.5 text-ink-500" />
@@ -505,6 +550,22 @@ const riskIconMap = {
                 class="h-full bg-gradient-to-r from-emerald-500 to-emerald-600 rounded-full transition-all duration-500"
                 :style="{ width: preparationPercentage + '%' }"
               />
+            </div>
+          </div>
+          <div
+            class="bg-gradient-to-br from-blue-50 to-blue-100/50 rounded-lg p-3 border border-blue-200 col-span-2 sm:col-span-2 lg:col-span-1 cursor-pointer hover:ring-2 hover:ring-blue-300 transition-all"
+            @click="router.push({ path: '/tasks', query: { planId: plan.id } })"
+          >
+            <div class="flex items-center gap-1.5 mb-1">
+              <ListTodo class="w-3.5 h-3.5 text-blue-600" />
+              <span class="text-[11px] text-blue-600/80">未解决任务</span>
+            </div>
+            <div class="text-xl sm:text-2xl font-bold text-blue-700 font-serif mb-1">{{ unresolvedPlanTasks.length }}</div>
+            <div class="text-[11px]">
+              <span v-if="planHighestSeverity" :class="['tag border', riskColors[planHighestSeverity]]">
+                最高{{ INSPECTION_SEVERITY_LABELS[planHighestSeverity] }}
+              </span>
+              <span v-else class="text-blue-600/70">暂无任务</span>
             </div>
           </div>
         </div>
@@ -785,6 +846,14 @@ const riskIconMap = {
                     <span :class="['tag border shrink-0', rehearsalResultColors[rc.rehearsalResult]]">
                       {{ REHEARSAL_RESULT_LABELS[rc.rehearsalResult] }}
                     </span>
+                    <button
+                      class="tag border bg-blue-50 text-blue-700 border-blue-200 shrink-0 hover:bg-blue-100 transition-colors"
+                      title="查看该角色的巡检任务"
+                      @click.stop="router.push({ path: '/tasks', query: { planId: plan.id, characterId: rc.characterId } })"
+                    >
+                      <ListTodo class="w-3 h-3 mr-1" />
+                      任务 {{ charUnresolvedTaskCount(rc.characterId) }}
+                    </button>
                     <template v-if="getFullCharacter(rc.characterId)">
                       <span
                         v-if="getFullCharacter(rc.characterId)!.riskLevel !== 'low'"
