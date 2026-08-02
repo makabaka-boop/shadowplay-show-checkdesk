@@ -1,7 +1,8 @@
 import { ref, computed, watch } from 'vue';
 import type { RehearsalPlan, RehearsalCharacter, RehearsalStatus, RehearsalResult, Character } from '../types';
-import { normalizeRehearsalPlan } from '../types';
+import { normalizeRehearsalPlan, reissueDuplicateIds } from '../types';
 import { useCharacters } from './useCharacters';
+import { useInspectionTasks } from './useInspectionTasks';
 
 const STORAGE_KEY = 'shadow-puppetry-rehearsal-plans';
 
@@ -94,10 +95,15 @@ export function useRehearsalPlans() {
 
   function cleanInvalidCharacters() {
     const validIds = new Set(characters.value.map(c => c.id));
+    const { blockTasksByPlanCleanup } = useInspectionTasks();
     let changed = false;
     rehearsalPlans.value.forEach((plan, idx) => {
       const valid = plan.characters.filter(c => validIds.has(c.characterId));
       if (valid.length !== plan.characters.length) {
+        // 计划清理无效角色时，关联任务不能丢失，进入 blocked 并保留来源信息
+        plan.characters
+          .filter(c => !validIds.has(c.characterId))
+          .forEach(c => blockTasksByPlanCleanup(plan.id, c.characterId));
         rehearsalPlans.value[idx] = normalizeRehearsalPlan({
           ...plan,
           characters: valid,
@@ -189,6 +195,11 @@ export function useRehearsalPlans() {
     const plan = getPlanById(planId);
     if (!plan) return null;
 
+    // 从计划移除角色时，关联任务不能丢失，进入 blocked 并保留来源信息
+    const character = characters.value.find(c => c.id === characterId);
+    const { blockTasksByPlanCleanup } = useInspectionTasks();
+    blockTasksByPlanCleanup(planId, characterId, character?.name ?? '');
+
     return updatePlan(planId, {
       characters: plan.characters.filter(c => c.characterId !== characterId),
     });
@@ -259,6 +270,28 @@ export function useRehearsalPlans() {
     return { total, pass, fail, needRehearse, notStarted, progress, passRate };
   }
 
+  // 从原始数组恢复排练计划：逐条 normalize，重建重复 id，替换当前数据
+  function restorePlans(
+    rawList: any[]
+  ): { count: number; invalidCount: number; reissued: number } {
+    const normalized: RehearsalPlan[] = [];
+    let invalidCount = 0;
+    (Array.isArray(rawList) ? rawList : []).forEach((item) => {
+      if (!item || typeof item !== 'object') {
+        invalidCount++;
+        return;
+      }
+      try {
+        normalized.push(normalizeRehearsalPlan(item));
+      } catch {
+        invalidCount++;
+      }
+    });
+    const { items, reissued } = reissueDuplicateIds(normalized, generateId);
+    rehearsalPlans.value = items;
+    return { count: items.length, invalidCount, reissued };
+  }
+
   return {
     rehearsalPlans,
     addPlan,
@@ -274,5 +307,6 @@ export function useRehearsalPlans() {
     getPlanStats,
     getValidPlanCharacters,
     cleanInvalidCharacters,
+    restorePlans,
   };
 }

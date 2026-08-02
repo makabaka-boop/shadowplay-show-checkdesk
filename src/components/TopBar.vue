@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, computed } from 'vue';
 import { useRouter } from 'vue-router';
 import {
   Upload,
@@ -13,14 +13,18 @@ import {
   Home,
   ClipboardCheck,
   Theater,
+  ListTodo,
+  LayoutDashboard,
 } from 'lucide-vue-next';
 import { useCharacters } from '../composables/useCharacters';
 import { useAutoCheck } from '../composables/useAutoCheck';
 import { useDemoMode } from '../composables/useDemoMode';
 import { useToast } from '../composables/useToast';
 import { useBatchOperations } from '../composables/useBatchOperations';
-import type { CharacterStatus } from '../types';
-import { STATUS_LABELS, BATCH_STATUSES } from '../types';
+import { useInspectionTasks } from '../composables/useInspectionTasks';
+import { useRehearsalPlans } from '../composables/useRehearsalPlans';
+import type { CharacterStatus, BackupBundle } from '../types';
+import { STATUS_LABELS, BATCH_STATUSES, BACKUP_BUNDLE_VERSION, isBackupBundle } from '../types';
 
 const router = useRouter();
 
@@ -33,29 +37,69 @@ const emit = defineEmits<{
   (e: 'dataImported'): void;
 }>();
 
-const { exportData, importData, characters } = useCharacters();
+const { importData, restoreCharacters, characters } = useCharacters();
 const { errorCount, warningCount } = useAutoCheck();
 const { isDemoMode, toggleDemoMode } = useDemoMode();
-const { success, error, warning } = useToast();
+const { success, error, warning, info } = useToast();
 const { selectedIds, hasSelection, selectedCount, batchUpdateStatus, clearSelection } = useBatchOperations();
+const { tasks, restoreTasks, validateTaskConsistency } = useInspectionTasks();
+const { rehearsalPlans, restorePlans } = useRehearsalPlans();
+
+const openTaskCount = computed(
+  () => tasks.value.filter(t => t.status === 'open' || t.status === 'in_progress' || t.status === 'blocked').length
+);
 
 const fileInputRef = ref<HTMLInputElement | null>(null);
 const showBatchMenu = ref(false);
 
 function handleExport() {
-  const json = exportData();
+  const bundle: BackupBundle = {
+    version: BACKUP_BUNDLE_VERSION,
+    exportedAt: new Date().toISOString(),
+    characters: characters.value,
+    rehearsalPlans: rehearsalPlans.value,
+    inspectionTasks: tasks.value,
+  };
+  const json = JSON.stringify(bundle, null, 2);
   const blob = new Blob([json], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `皮影演出核对备份_${new Date().toISOString().slice(0, 10)}.json`;
+  a.download = `皮影检查台备份包_${new Date().toISOString().slice(0, 10)}.json`;
   a.click();
   URL.revokeObjectURL(url);
-  success(`已保存 ${characters.value.length} 条角色核对记录`);
+  success(
+    `已导出检查台备份包：角色 ${characters.value.length} · 排练计划 ${rehearsalPlans.value.length} · 巡检任务 ${tasks.value.length}`
+  );
 }
 
 function triggerImport() {
   fileInputRef.value?.click();
+}
+
+// 从备份包恢复：分别 restore，再做一致性校验（无效 characterId/planId 关联任务置 blocked）
+function restoreFromBundle(raw: any) {
+  const charResult = restoreCharacters(Array.isArray(raw.characters) ? raw.characters : []);
+  const planResult = restorePlans(Array.isArray(raw.rehearsalPlans) ? raw.rehearsalPlans : []);
+  const taskResult = restoreTasks(Array.isArray(raw.inspectionTasks) ? raw.inspectionTasks : []);
+
+  const validCharacterIds = new Set(characters.value.map(c => c.id));
+  const validPlanIds = new Set(rehearsalPlans.value.map(p => p.id));
+  const blockedCount = validateTaskConsistency(validCharacterIds, validPlanIds);
+
+  const reissuedTotal = charResult.reissued + planResult.reissued + taskResult.reissued;
+
+  success(
+    `备份包已恢复：角色 ${charResult.count} · 排练计划 ${planResult.count} · 巡检任务 ${taskResult.count}`
+  );
+  if (reissuedTotal > 0) {
+    warning(`检测到重复 id，已自动重建 ${reissuedTotal} 个（角色 ${charResult.reissued} · 排练计划 ${planResult.reissued} · 巡检任务 ${taskResult.reissued}）`);
+  }
+  if (blockedCount > 0) {
+    info(`一致性校验：${blockedCount} 个关联对象缺失的任务已标记为「已阻塞」，来源信息保留`);
+  }
+  clearSelection();
+  emit('dataImported');
 }
 
 function handleFileChange(event: Event) {
@@ -66,17 +110,34 @@ function handleFileChange(event: Event) {
   const reader = new FileReader();
   reader.onload = (e) => {
     const content = e.target?.result as string;
-    const result = importData(content);
-    if (result.success) {
-      if (result.invalidCount > 0) {
-        warning(`已载入 ${result.count} 条核对记录，另有 ${result.invalidCount} 条格式异常已跳过或补全`);
-      } else {
-        success(`已载入 ${result.count} 条角色核对记录`);
-      }
-      clearSelection();
-      emit('dataImported');
-    } else {
+    let parsed: any;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
       error('载入失败：文件格式不正确或内容损坏');
+      target.value = '';
+      return;
+    }
+
+    if (isBackupBundle(parsed)) {
+      // 版本 2 备份包
+      restoreFromBundle(parsed);
+    } else if (Array.isArray(parsed)) {
+      // 兼容旧版：纯角色数组导入
+      const result = importData(content);
+      if (result.success) {
+        if (result.invalidCount > 0) {
+          warning(`已载入 ${result.count} 条核对记录，另有 ${result.invalidCount} 条格式异常已跳过或补全`);
+        } else {
+          success(`已载入 ${result.count} 条角色核对记录（旧版格式）`);
+        }
+        clearSelection();
+        emit('dataImported');
+      } else {
+        error('载入失败：文件格式不正确或内容损坏');
+      }
+    } else {
+      error('载入失败：无法识别的文件格式');
     }
   };
   reader.onerror = () => {
@@ -122,6 +183,20 @@ function handleBatchStatus(status: CharacterStatus) {
                 : 'bg-white/10 text-rice-100 hover:bg-white/20'
             ]"
             @click="router.push('/')"
+          >
+            <LayoutDashboard class="w-4 h-4" />
+            <span class="hidden sm:inline">工作台</span>
+            <span class="sm:hidden">总览</span>
+          </button>
+
+          <button
+            :class="[
+              'inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-all',
+              router.currentRoute.value.name === 'characters'
+                ? 'bg-white/20 text-white'
+                : 'bg-white/10 text-rice-100 hover:bg-white/20'
+            ]"
+            @click="router.push('/characters')"
           >
             <Home class="w-4 h-4" />
             <span class="hidden sm:inline">角色核对</span>
@@ -170,6 +245,26 @@ function handleBatchStatus(status: CharacterStatus) {
             <span class="sm:hidden">排练</span>
           </button>
 
+          <button
+            :class="[
+              'relative inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-all',
+              router.currentRoute.value.name === 'inspection'
+                ? 'bg-white/20 text-white'
+                : 'bg-white/10 text-rice-100 hover:bg-white/20'
+            ]"
+            @click="router.push('/inspection')"
+          >
+            <ListTodo class="w-4 h-4" />
+            <span class="hidden sm:inline">巡检任务</span>
+            <span class="sm:hidden">巡检</span>
+            <span
+              v-if="openTaskCount > 0"
+              class="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] px-1 rounded-full bg-gold-500 text-white text-[10px] font-bold flex items-center justify-center shadow"
+            >
+              {{ openTaskCount }}
+            </span>
+          </button>
+
           <div class="flex items-center gap-2 mx-2 bg-white/10 rounded-md px-3 py-1.5">
             <AlertCircle class="w-4 h-4 text-rice-200" />
             <span class="text-xs">共 <span class="font-bold text-rice-100">{{ characters.length }}</span> 个角色</span>
@@ -195,13 +290,13 @@ function handleBatchStatus(status: CharacterStatus) {
             <span class="sm:hidden">核对</span>
           </button>
 
-          <button class="btn-secondary !py-1.5 !bg-white/10 !text-white !border-white/20 hover:!bg-white/20" @click="triggerImport">
+          <button class="btn-secondary !py-1.5 !bg-white/10 !text-white !border-white/20 hover:!bg-white/20" @click="triggerImport" title="载入备份包或旧版角色数据">
             <Upload class="w-4 h-4" />
             <span class="hidden sm:inline">载入</span>
           </button>
-          <button class="btn-secondary !py-1.5 !bg-white/10 !text-white !border-white/20 hover:!bg-white/20" @click="handleExport">
+          <button class="btn-secondary !py-1.5 !bg-white/10 !text-white !border-white/20 hover:!bg-white/20" @click="handleExport" title="导出角色 / 排练计划 / 巡检任务备份包">
             <Download class="w-4 h-4" />
-            <span class="hidden sm:inline">备份</span>
+            <span class="hidden sm:inline">备份包</span>
           </button>
 
           <div class="relative" v-if="hasSelection">
