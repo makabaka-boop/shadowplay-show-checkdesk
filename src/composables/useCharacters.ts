@@ -2,6 +2,7 @@ import { ref, computed, watch } from 'vue';
 import type { Character } from '../types';
 import { normalizeCharacter } from '../types';
 import { mockCharacters } from '../data/mockData';
+import { useInspectionTasks } from './useInspectionTasks';
 
 const STORAGE_KEY = 'shadow-puppetry-characters';
 
@@ -52,6 +53,12 @@ watch(characters, (newVal) => {
 }, { deep: true });
 
 export function useCharacters() {
+  const { syncTasksFromCharacters, blockTasksForMissingCharacter } = useInspectionTasks();
+
+  function triggerTaskSync() {
+    try { syncTasksFromCharacters(characters.value, []); } catch { /* noop */ }
+  }
+
   function generateId(): string {
     return 'char_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   }
@@ -65,6 +72,7 @@ export function useCharacters() {
       updatedAt: now,
     });
     characters.value.push(newChar);
+    triggerTaskSync();
     return newChar;
   }
 
@@ -76,6 +84,7 @@ export function useCharacters() {
         ...updates,
         updatedAt: new Date().toISOString(),
       });
+      triggerTaskSync();
       return characters.value[index];
     }
     return null;
@@ -84,7 +93,9 @@ export function useCharacters() {
   function deleteCharacter(id: string) {
     const index = characters.value.findIndex(c => c.id === id);
     if (index !== -1) {
+      const removed = characters.value[index];
       characters.value.splice(index, 1);
+      blockTasksForMissingCharacter(id, removed.name);
       return true;
     }
     return false;
@@ -123,30 +134,42 @@ export function useCharacters() {
     return JSON.stringify(characters.value, null, 2);
   }
 
-  function importData(jsonStr: string): { success: boolean; count: number; invalidCount: number } {
+  function importData(jsonStr: string): { success: boolean; count: number; invalidCount: number; duplicateCount: number } {
     try {
       const parsed = JSON.parse(jsonStr);
       if (!Array.isArray(parsed)) {
-        return { success: false, count: 0, invalidCount: 0 };
+        return { success: false, count: 0, invalidCount: 0, duplicateCount: 0 };
       }
       const normalized: Character[] = [];
+      const existingIds = new Set(characters.value.map(c => c.id));
       let invalidCount = 0;
+      let duplicateCount = 0;
       parsed.forEach((item) => {
         if (!item || typeof item !== 'object') {
           invalidCount++;
           return;
         }
         try {
-          normalized.push(normalizeCharacter(item));
+          let char = normalizeCharacter(item);
+          if (existingIds.has(char.id)) {
+            char = normalizeCharacter({
+              ...char,
+              id: 'char_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+            });
+            duplicateCount++;
+          }
+          existingIds.add(char.id);
+          normalized.push(char);
         } catch {
           invalidCount++;
         }
       });
       characters.value = normalized;
       notifyImportListeners();
-      return { success: true, count: normalized.length, invalidCount };
+      triggerTaskSync();
+      return { success: true, count: normalized.length, invalidCount, duplicateCount };
     } catch {
-      return { success: false, count: 0, invalidCount: 0 };
+      return { success: false, count: 0, invalidCount: 0, duplicateCount: 0 };
     }
   }
 

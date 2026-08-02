@@ -31,6 +31,10 @@ import {
   Users,
   ArrowRight,
   Wrench,
+  Flag,
+  CheckCircle2,
+  Loader,
+  Ban,
 } from 'lucide-vue-next';
 import TopBar from '../components/TopBar.vue';
 import ToastContainer from '../components/ToastContainer.vue';
@@ -39,6 +43,7 @@ import { useRehearsalPlans } from '../composables/useRehearsalPlans';
 import { useCharacters } from '../composables/useCharacters';
 import { useToast } from '../composables/useToast';
 import { useBatchOperations } from '../composables/useBatchOperations';
+import { useInspectionTasks } from '../composables/useInspectionTasks';
 import type {
   RehearsalPlan,
   RehearsalStatus,
@@ -48,6 +53,8 @@ import type {
   RiskLevel,
   HandoverStatus,
   AccessoryGap,
+  InspectionTask,
+  TaskSeverity,
 } from '../types';
 import {
   REHEARSAL_STATUS_LABELS,
@@ -55,6 +62,8 @@ import {
   RISK_LABELS,
   HANDOVER_LABELS,
   STATUS_LABELS,
+  TASK_SEVERITY_LABELS,
+  TASK_STATUS_LABELS,
 } from '../types';
 
 const route = useRoute();
@@ -72,10 +81,26 @@ const {
 const { characters, allStories } = useCharacters();
 const { success, warning, error } = useToast();
 const { clearSelection } = useBatchOperations();
+const {
+  getPlanTaskStats,
+  getTasksByCharacterId,
+  getUnresolvedTasksByCharacterId,
+  resolveTask,
+  updateTask,
+  deleteTask,
+  createManualTaskForCharacter,
+  syncTasksFromCharacters,
+} = useInspectionTasks();
 
 const planId = computed(() => route.params.id as string);
 const plan = computed<RehearsalPlan | undefined>(() => getPlanById(planId.value));
 const planStats = computed(() => plan.value ? getPlanStats(plan.value) : null);
+const planTaskStats = computed(() => plan.value ? getPlanTaskStats(plan.value.id) : null);
+
+const showQuickTaskFor = ref<string | null>(null);
+const quickTaskTitle = ref('');
+const quickTaskDescription = ref('');
+const quickTaskSeverity = ref<TaskSeverity>('medium');
 
 const showModal = ref(false);
 const showAddCharacter = ref(false);
@@ -101,6 +126,9 @@ const visibleIds = computed(() => {
 
 onMounted(() => {
   clearSelection();
+  if (plan.value) {
+    syncTasksFromCharacters(characters.value, [plan.value]);
+  }
 });
 
 const sortedCharacters = computed(() => {
@@ -268,12 +296,21 @@ function cancelEdit() {
 
 function saveEdit() {
   if (!editingCharacterId.value || !plan.value) return;
+  const prev = plan.value.characters.find(c => c.characterId === editingCharacterId.value);
   updateCharacterResult(plan.value.id, editingCharacterId.value, {
     rehearsalResult: editResultForm.result,
     rehearsalNote: editResultForm.note,
     checkedBy: editResultForm.checkedBy,
   });
-  success('已更新排练结果');
+  if (editResultForm.result === 'fail') {
+    success('已更新排练结果，并已创建/更新高严重度巡检任务');
+  } else if (editResultForm.result === 'need_rehearse') {
+    success('已更新排练结果，并已创建/更新中严重度巡检任务');
+  } else if (editResultForm.result === 'pass' && prev && (prev.rehearsalResult === 'fail' || prev.rehearsalResult === 'need_rehearse')) {
+    success('已更新排练结果，相关系统排练任务已自动解决');
+  } else {
+    success('已更新排练结果');
+  }
   editingCharacterId.value = null;
 }
 
@@ -282,7 +319,15 @@ function quickSetResult(rc: RehearsalCharacter, result: RehearsalResult) {
   updateCharacterResult(plan.value.id, rc.characterId, {
     rehearsalResult: result,
   });
-  success(`已标记为「${REHEARSAL_RESULT_LABELS[result]}」`);
+  if (result === 'fail') {
+    success(`已标记为「${REHEARSAL_RESULT_LABELS[result]}」，已创建/更新高严重度巡检任务`);
+  } else if (result === 'need_rehearse') {
+    success(`已标记为「${REHEARSAL_RESULT_LABELS[result]}」，已创建/更新中严重度巡检任务`);
+  } else if (result === 'pass') {
+    success(`已标记为「${REHEARSAL_RESULT_LABELS[result]}」`);
+  } else {
+    success(`已标记为「${REHEARSAL_RESULT_LABELS[result]}」`);
+  }
 }
 
 function addCharacter(characterId: string) {
@@ -295,9 +340,87 @@ function addCharacter(characterId: string) {
 function removeCharacter(characterId: string) {
   if (!plan.value) return;
   const char = getFullCharacter(characterId);
-  if (!confirm(`确定移除角色「${char?.name || '未知'}」吗？`)) return;
+  if (!confirm(`确定移除角色「${char?.name || '未知'}」吗？关联的巡检任务将进入阻塞状态。`)) return;
   removeCharacterFromPlan(plan.value.id, characterId);
-  success('已移除角色');
+  success('已移除角色，关联巡检任务已进入阻塞状态');
+}
+
+function getCharacterTasks(characterId: string): InspectionTask[] {
+  return getTasksByCharacterId(characterId).filter(t => t.planId === plan.value?.id || !t.planId);
+}
+
+function getUnresolvedCharacterTasks(characterId: string): InspectionTask[] {
+  return getUnresolvedTasksByCharacterId(characterId).filter(t => t.planId === plan.value?.id);
+}
+
+function getTaskStatusClass(status: InspectionTask['status']): string {
+  const map: Record<string, string> = {
+    open: 'bg-blue-50 text-blue-700 border-blue-200',
+    in_progress: 'bg-amber-50 text-amber-700 border-amber-200',
+    blocked: 'bg-red-50 text-red-700 border-red-200',
+    resolved: 'bg-green-50 text-green-700 border-green-200',
+    dismissed: 'bg-gray-50 text-gray-600 border-gray-200',
+  };
+  return map[status] || map.open;
+}
+
+function getTaskSeverityClass(severity: TaskSeverity): string {
+  const map: Record<TaskSeverity, string> = {
+    low: 'bg-gray-100 text-gray-700 border-gray-200',
+    medium: 'bg-yellow-100 text-yellow-700 border-yellow-200',
+    high: 'bg-orange-100 text-orange-700 border-orange-200',
+    critical: 'bg-red-100 text-red-700 border-red-200',
+  };
+  return map[severity];
+}
+
+function handleResolveTask(taskId: string) {
+  resolveTask(taskId);
+  success('巡检任务已标记为解决');
+}
+
+function handleDeleteTask(taskId: string) {
+  if (confirm('确定删除该巡检任务？')) {
+    deleteTask(taskId);
+    success('巡检任务已删除');
+  }
+}
+
+function cycleTaskStatus(task: InspectionTask) {
+  const order: InspectionTask['status'][] = ['open', 'in_progress', 'blocked'];
+  const idx = order.indexOf(task.status);
+  const next = order[(idx + 1) % order.length];
+  updateTask(task.id, { status: next });
+}
+
+function openQuickTask(characterId: string) {
+  showQuickTaskFor.value = characterId;
+  quickTaskTitle.value = '';
+  quickTaskDescription.value = '';
+  quickTaskSeverity.value = 'medium';
+}
+
+function cancelQuickTask() {
+  showQuickTaskFor.value = null;
+  quickTaskTitle.value = '';
+  quickTaskDescription.value = '';
+}
+
+function submitQuickTask(characterId: string) {
+  if (!quickTaskTitle.value.trim()) {
+    error('请填写任务标题');
+    return;
+  }
+  const char = getFullCharacter(characterId);
+  if (!char) return;
+  createManualTaskForCharacter(char, {
+    title: quickTaskTitle.value.trim(),
+    description: quickTaskDescription.value.trim(),
+    severity: quickTaskSeverity.value,
+    assignee: char.owner || '',
+  });
+  success('巡检任务已创建');
+  cancelQuickTask();
 }
 
 function moveOrder(characterId: string, direction: 'up' | 'down') {
@@ -445,7 +568,7 @@ const riskIconMap = {
           </div>
         </div>
 
-        <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2 sm:gap-3 pt-4 border-t border-rice-200">
+        <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-9 gap-2 sm:gap-3 pt-4 border-t border-rice-200">
           <div class="bg-gradient-to-br from-ink-50 to-ink-100/50 rounded-lg p-3 border border-ink-200">
             <div class="flex items-center gap-1.5 mb-1">
               <Users class="w-3.5 h-3.5 text-ink-500" />
@@ -506,6 +629,31 @@ const riskIconMap = {
                 :style="{ width: preparationPercentage + '%' }"
               />
             </div>
+          </div>
+          <div
+            :class="[
+              'rounded-lg p-3 border col-span-2 sm:col-span-2 lg:col-span-1 cursor-pointer transition-all hover:shadow-md',
+              planTaskStats && planTaskStats.unresolved > 0
+                ? planTaskStats.highestSeverity === 'critical'
+                  ? 'bg-gradient-to-br from-red-50 to-red-100/50 border-red-300 ring-1 ring-red-300'
+                  : planTaskStats.highestSeverity === 'high'
+                  ? 'bg-gradient-to-br from-orange-50 to-orange-100/50 border-orange-200'
+                  : 'bg-gradient-to-br from-cinnabar-50 to-cinnabar-100/50 border-cinnabar-200'
+                : 'bg-gradient-to-br from-bamboo-50 to-bamboo-100/50 border-bamboo-200'
+            ]"
+            @click="router.push('/inspection')"
+          >
+            <div class="flex items-center gap-1.5 mb-1">
+              <Flag class="w-3.5 h-3.5" :class="planTaskStats && planTaskStats.unresolved > 0 ? 'text-cinnabar-600' : 'text-bamboo-600'" />
+              <span class="text-[11px]" :class="planTaskStats && planTaskStats.unresolved > 0 ? 'text-cinnabar-600/80' : 'text-bamboo-600/80'">未解决任务</span>
+            </div>
+            <div class="text-xl sm:text-2xl font-bold font-serif" :class="planTaskStats && planTaskStats.unresolved > 0 ? 'text-cinnabar-700' : 'text-bamboo-700'">
+              {{ planTaskStats?.unresolved || 0 }}
+            </div>
+            <div v-if="planTaskStats && planTaskStats.unresolved > 0" class="text-[10px] mt-0.5" :class="planTaskStats.highestSeverity === 'critical' ? 'text-red-600' : planTaskStats.highestSeverity === 'high' ? 'text-orange-600' : 'text-cinnabar-600'">
+              最高严重度：{{ planTaskStats.highestSeverity ? TASK_SEVERITY_LABELS[planTaskStats.highestSeverity] : '-' }}
+            </div>
+            <div v-else class="text-[10px] text-bamboo-600/70 mt-0.5">全部已解决</div>
           </div>
         </div>
       </div>
@@ -807,6 +955,14 @@ const riskIconMap = {
                         <User class="w-3 h-3 mr-1" />
                         未分配
                       </span>
+                      <span
+                        v-if="getUnresolvedCharacterTasks(rc.characterId).length > 0"
+                        class="tag border shrink-0 flex items-center gap-1 bg-cinnabar-50 text-cinnabar-700 border-cinnabar-200 cursor-pointer hover:bg-cinnabar-100"
+                        @click.stop="toggleExpand(rc.characterId)"
+                      >
+                        <Flag class="w-3 h-3" />
+                        {{ getUnresolvedCharacterTasks(rc.characterId).length }} 个巡检任务
+                      </span>
                     </template>
                   </div>
 
@@ -874,6 +1030,135 @@ const riskIconMap = {
                     >
                       <ClipboardCheck class="w-4 h-4 flex-shrink-0 mt-0.5" />
                       <span>交接备注：{{ getFullCharacter(rc.characterId)!.handoverNote }}</span>
+                    </div>
+
+                    <div class="pt-2 border-t border-rice-100 space-y-2">
+                      <div class="flex items-center justify-between">
+                        <div class="flex items-center gap-1.5 text-xs font-medium text-ink-700">
+                          <Flag class="w-3.5 h-3.5 text-cinnabar-600" />
+                          关联巡检任务
+                          <span
+                            v-if="getUnresolvedCharacterTasks(rc.characterId).length > 0"
+                            class="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full bg-cinnabar-100 text-cinnabar-700 text-[10px] font-bold"
+                          >
+                            {{ getUnresolvedCharacterTasks(rc.characterId).length }} 待处理
+                          </span>
+                        </div>
+                        <button
+                          v-if="showQuickTaskFor !== rc.characterId"
+                          class="inline-flex items-center gap-1 text-xs text-cinnabar-700 hover:text-cinnabar-800 font-medium"
+                          @click.stop="openQuickTask(rc.characterId)"
+                        >
+                          <Plus class="w-3 h-3" />
+                          新建任务
+                        </button>
+                      </div>
+
+                      <div v-if="showQuickTaskFor === rc.characterId" class="p-2.5 rounded-md bg-cinnabar-50/50 border border-cinnabar-200 space-y-2">
+                        <input
+                          v-model="quickTaskTitle"
+                          type="text"
+                          placeholder="任务标题"
+                          class="w-full px-2.5 py-1.5 text-xs border border-ink-200 rounded focus:outline-none focus:ring-2 focus:ring-cinnabar-500/30 focus:border-cinnabar-500"
+                          @click.stop
+                        />
+                        <textarea
+                          v-model="quickTaskDescription"
+                          rows="2"
+                          placeholder="任务描述（可选）"
+                          class="w-full px-2.5 py-1.5 text-xs border border-ink-200 rounded resize-none focus:outline-none focus:ring-2 focus:ring-cinnabar-500/30 focus:border-cinnabar-500"
+                          @click.stop
+                        ></textarea>
+                        <div class="flex items-center justify-between gap-2">
+                          <select
+                            v-model="quickTaskSeverity"
+                            class="px-2 py-1 text-xs border border-ink-200 rounded bg-white focus:outline-none"
+                            @click.stop
+                          >
+                            <option value="low">低</option>
+                            <option value="medium">中</option>
+                            <option value="high">高</option>
+                            <option value="critical">严重</option>
+                          </select>
+                          <div class="flex items-center gap-1.5">
+                            <button class="px-2 py-1 text-xs text-ink-500 hover:text-ink-700" @click.stop="cancelQuickTask">取消</button>
+                            <button class="px-2.5 py-1 text-xs bg-cinnabar-700 text-white rounded hover:bg-cinnabar-800" @click.stop="submitQuickTask(rc.characterId)">创建</button>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div v-if="getCharacterTasks(rc.characterId).length > 0" class="space-y-1.5">
+                        <div
+                          v-for="task in getCharacterTasks(rc.characterId)"
+                          :key="task.id"
+                          :class="[
+                            'p-2 rounded-md border text-xs',
+                            task.status === 'blocked'
+                              ? 'bg-red-50/60 border-red-200'
+                              : task.status === 'resolved'
+                              ? 'bg-green-50/60 border-green-200 opacity-70'
+                              : task.status === 'dismissed'
+                              ? 'bg-gray-50 border-gray-200 opacity-60'
+                              : task.sourceType === 'rehearsal'
+                              ? 'bg-cinnabar-50/40 border-cinnabar-200'
+                              : 'bg-white border-ink-200'
+                          ]"
+                        >
+                          <div class="flex items-start justify-between gap-2">
+                            <div class="flex-1 min-w-0">
+                              <div class="flex items-center gap-1 flex-wrap mb-0.5">
+                                <span
+                                  class="inline-flex items-center gap-0.5 px-1 py-px rounded text-[10px] font-medium border"
+                                  :class="getTaskStatusClass(task.status)"
+                                >
+                                  {{ TASK_STATUS_LABELS[task.status] }}
+                                </span>
+                                <span
+                                  class="inline-flex items-center gap-0.5 px-1 py-px rounded text-[10px] font-medium border"
+                                  :class="getTaskSeverityClass(task.severity)"
+                                >
+                                  {{ TASK_SEVERITY_LABELS[task.severity] }}
+                                </span>
+                              </div>
+                              <div
+                                class="font-medium text-ink-800 leading-snug"
+                                :class="{ 'line-through text-ink-400': task.status === 'resolved' || task.status === 'dismissed' }"
+                              >
+                                {{ task.title }}
+                              </div>
+                              <div v-if="task.description" class="text-ink-500 mt-0.5 line-clamp-2 whitespace-pre-wrap">{{ task.description }}</div>
+                            </div>
+                            <div class="flex items-center gap-0.5 flex-shrink-0">
+                              <button
+                                v-if="task.status !== 'resolved' && task.status !== 'dismissed'"
+                                class="p-0.5 text-green-600 hover:bg-green-100 rounded"
+                                title="标记解决"
+                                @click.stop="handleResolveTask(task.id)"
+                              >
+                                <CheckCircle2 class="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                v-if="task.status === 'open' || task.status === 'in_progress' || task.status === 'blocked'"
+                                class="p-0.5 text-ink-500 hover:bg-ink-100 rounded"
+                                title="切换状态"
+                                @click.stop="cycleTaskStatus(task)"
+                              >
+                                <Loader class="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                class="p-0.5 text-red-500 hover:bg-red-100 rounded"
+                                title="删除"
+                                @click.stop="handleDeleteTask(task.id)"
+                              >
+                                <Trash2 class="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                      <div v-else-if="showQuickTaskFor !== rc.characterId" class="text-xs text-ink-400 italic">
+                        该角色暂无关联巡检任务
+                      </div>
                     </div>
 
                     <div v-if="editingCharacterId !== rc.characterId && plan.status !== 'completed' && plan.status !== 'cancelled'" class="flex flex-wrap gap-2 pt-2 border-t border-rice-100">

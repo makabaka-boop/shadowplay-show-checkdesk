@@ -1,9 +1,11 @@
 import { computed } from 'vue';
 import type { CheckResult, Character } from '../types';
 import { useCharacters } from './useCharacters';
+import { useInspectionTasks } from './useInspectionTasks';
 
 export function useAutoCheck() {
   const { characters } = useCharacters();
+  const { tasks } = useInspectionTasks();
 
   function hasMissingAccessories(char: Character): boolean {
     return char.missingAccessories.some(a => a.available < a.required);
@@ -12,6 +14,26 @@ export function useAutoCheck() {
   function isHighRisk(char: Character): boolean {
     return char.riskLevel === 'high' || char.riskLevel === 'critical';
   }
+
+  function getUnresolvedTaskCount(charId: string): number {
+    return tasks.value.filter(
+      t => t.characterId === charId && t.status !== 'resolved' && t.status !== 'dismissed'
+    ).length;
+  }
+
+  function hasUnresolvedTasks(charId: string): boolean {
+    return getUnresolvedTaskCount(charId) > 0;
+  }
+
+  const pendingTaskCountByCharacter = computed<Record<string, number>>(() => {
+    const map: Record<string, number> = {};
+    tasks.value.forEach(t => {
+      if (t.characterId && t.status !== 'resolved' && t.status !== 'dismissed') {
+        map[t.characterId] = (map[t.characterId] || 0) + 1;
+      }
+    });
+    return map;
+  });
 
   const allCheckResults = computed<CheckResult[]>(() => {
     const results: CheckResult[] = [];
@@ -105,6 +127,22 @@ export function useAutoCheck() {
       });
     }
 
+    // 7. 检查存在未解决巡检任务的角色
+    const pendingTaskCharIds = chars
+      .filter(c => hasUnresolvedTasks(c.id))
+      .map(c => c.id);
+    if (pendingTaskCharIds.length > 0) {
+      const totalPending = pendingTaskCharIds.reduce(
+        (sum, id) => sum + getUnresolvedTaskCount(id),
+        0
+      );
+      results.push({
+        type: 'warning',
+        message: `${pendingTaskCharIds.length} 个角色存在 ${totalPending} 个未解决巡检任务`,
+        characterIds: pendingTaskCharIds,
+      });
+    }
+
     return results;
   });
 
@@ -135,5 +173,8 @@ export function useAutoCheck() {
     warningCount,
     hasMissingAccessories,
     isHighRisk,
+    getUnresolvedTaskCount,
+    hasUnresolvedTasks,
+    pendingTaskCountByCharacter,
   };
 }
