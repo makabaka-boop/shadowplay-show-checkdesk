@@ -31,6 +31,7 @@ import {
   Users,
   ArrowRight,
   Wrench,
+  ShieldAlert,
 } from 'lucide-vue-next';
 import TopBar from '../components/TopBar.vue';
 import ToastContainer from '../components/ToastContainer.vue';
@@ -39,6 +40,7 @@ import { useRehearsalPlans } from '../composables/useRehearsalPlans';
 import { useCharacters } from '../composables/useCharacters';
 import { useToast } from '../composables/useToast';
 import { useBatchOperations } from '../composables/useBatchOperations';
+import { useInspectionTasks } from '../composables/useInspectionTasks';
 import type {
   RehearsalPlan,
   RehearsalStatus,
@@ -48,6 +50,8 @@ import type {
   RiskLevel,
   HandoverStatus,
   AccessoryGap,
+  InspectionTask,
+  InspectionSeverity,
 } from '../types';
 import {
   REHEARSAL_STATUS_LABELS,
@@ -55,6 +59,7 @@ import {
   RISK_LABELS,
   HANDOVER_LABELS,
   STATUS_LABELS,
+  INSPECTION_STATUS_LABELS,
 } from '../types';
 
 const route = useRoute();
@@ -72,10 +77,46 @@ const {
 const { characters, allStories } = useCharacters();
 const { success, warning, error } = useToast();
 const { clearSelection } = useBatchOperations();
+const {
+  getUnresolvedTasksByPlan,
+  getMaxSeverityForPlan,
+  getUnresolvedTasksByCharacter,
+  getUnresolvedTaskCountByCharacter,
+  upsertRehearsalResultTask,
+  resolveTask,
+  updateTask: updateInspectionTask,
+} = useInspectionTasks();
 
 const planId = computed(() => route.params.id as string);
 const plan = computed<RehearsalPlan | undefined>(() => getPlanById(planId.value));
 const planStats = computed(() => plan.value ? getPlanStats(plan.value) : null);
+
+const planUnresolvedTasks = computed<InspectionTask[]>(() => {
+  if (!plan.value) return [];
+  return getUnresolvedTasksByPlan(plan.value.id);
+});
+
+const planUnresolvedCount = computed(() => planUnresolvedTasks.value.length);
+
+const planMaxSeverity = computed<InspectionSeverity | null>(() => {
+  if (!plan.value) return null;
+  return getMaxSeverityForPlan(plan.value.id);
+});
+
+const maxSeverityLabel = computed(() => {
+  if (!planMaxSeverity.value) return '';
+  return RISK_LABELS[planMaxSeverity.value as RiskLevel] || '';
+});
+
+const maxSeverityColor = computed(() => {
+  const map: Record<string, string> = {
+    critical: 'bg-red-50 text-red-700 border-red-200',
+    high: 'bg-orange-50 text-orange-700 border-orange-200',
+    medium: 'bg-yellow-50 text-yellow-700 border-yellow-200',
+    low: 'bg-green-50 text-green-700 border-green-200',
+  };
+  return map[planMaxSeverity.value || ''] || 'bg-gray-50 text-gray-600 border-gray-200';
+});
 
 const showModal = ref(false);
 const showAddCharacter = ref(false);
@@ -273,7 +314,20 @@ function saveEdit() {
     rehearsalNote: editResultForm.note,
     checkedBy: editResultForm.checkedBy,
   });
-  success('已更新排练结果');
+  if (editResultForm.result === 'fail' || editResultForm.result === 'need_rehearse') {
+    const char = getFullCharacter(editingCharacterId.value);
+    upsertRehearsalResultTask(
+      { id: plan.value.id, name: plan.value.name, story: plan.value.story, owner: plan.value.owner },
+      editingCharacterId.value,
+      char?.name || editingCharacterId.value,
+      editResultForm.result,
+      editResultForm.note,
+      editResultForm.checkedBy
+    );
+    success(`已更新排练结果并${editResultForm.result === 'fail' ? '创建高严重度' : '创建中严重度'}巡检任务`);
+  } else {
+    success('已更新排练结果');
+  }
   editingCharacterId.value = null;
 }
 
@@ -282,7 +336,44 @@ function quickSetResult(rc: RehearsalCharacter, result: RehearsalResult) {
   updateCharacterResult(plan.value.id, rc.characterId, {
     rehearsalResult: result,
   });
-  success(`已标记为「${REHEARSAL_RESULT_LABELS[result]}」`);
+  if (result === 'fail' || result === 'need_rehearse') {
+    const char = getFullCharacter(rc.characterId);
+    upsertRehearsalResultTask(
+      { id: plan.value.id, name: plan.value.name, story: plan.value.story, owner: plan.value.owner },
+      rc.characterId,
+      char?.name || rc.characterId,
+      result,
+      rc.rehearsalNote,
+      rc.checkedBy
+    );
+    success(`已标记为「${REHEARSAL_RESULT_LABELS[result]}」，巡检任务已同步`);
+  } else {
+    success(`已标记为「${REHEARSAL_RESULT_LABELS[result]}」`);
+  }
+}
+
+function getCharRehearsalTask(charId: string): InspectionTask | undefined {
+  if (!plan.value) return undefined;
+  return getUnresolvedTasksByCharacter(charId).find(
+    t => t.sourceType === 'rehearsal' && t.planId === plan.value!.id
+  );
+}
+
+function getCharTaskCount(charId: string): number {
+  if (!plan.value) return 0;
+  return getUnresolvedTasksByCharacter(charId).filter(
+    t => t.planId === plan.value!.id
+  ).length;
+}
+
+function handleResolveTask(task: InspectionTask) {
+  resolveTask(task.id);
+  success(`任务「${task.title}」已标记为解决`);
+}
+
+function handleStartTask(task: InspectionTask) {
+  updateInspectionTask(task.id, { status: 'in_progress' });
+  success(`任务「${task.title}」已开始处理`);
 }
 
 function addCharacter(characterId: string) {
@@ -445,7 +536,7 @@ const riskIconMap = {
           </div>
         </div>
 
-        <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2 sm:gap-3 pt-4 border-t border-rice-200">
+        <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2 sm:gap-3 pt-4 border-t border-rice-200">
           <div class="bg-gradient-to-br from-ink-50 to-ink-100/50 rounded-lg p-3 border border-ink-200">
             <div class="flex items-center gap-1.5 mb-1">
               <Users class="w-3.5 h-3.5 text-ink-500" />
@@ -505,6 +596,16 @@ const riskIconMap = {
                 class="h-full bg-gradient-to-r from-emerald-500 to-emerald-600 rounded-full transition-all duration-500"
                 :style="{ width: preparationPercentage + '%' }"
               />
+            </div>
+          </div>
+          <div :class="['bg-gradient-to-br rounded-lg p-3 border col-span-1', planUnresolvedCount > 0 ? (planMaxSeverity === 'critical' || planMaxSeverity === 'high' ? 'from-red-50 to-red-100/50 border-red-200' : 'from-cinnabar-50 to-cinnabar-100/50 border-cinnabar-200') : 'from-gray-50 to-gray-100/50 border-gray-200']">
+            <div class="flex items-center gap-1.5 mb-1">
+              <ShieldAlert :class="['w-3.5 h-3.5', planUnresolvedCount > 0 ? (planMaxSeverity === 'critical' || planMaxSeverity === 'high' ? 'text-red-600' : 'text-cinnabar-600') : 'text-gray-500']" />
+              <span :class="['text-[11px]', planUnresolvedCount > 0 ? (planMaxSeverity === 'critical' || planMaxSeverity === 'high' ? 'text-red-600/80' : 'text-cinnabar-600/80') : 'text-gray-500']">巡检待办</span>
+            </div>
+            <div :class="['text-xl sm:text-2xl font-bold font-serif', planUnresolvedCount > 0 ? (planMaxSeverity === 'critical' || planMaxSeverity === 'high' ? 'text-red-700' : 'text-cinnabar-700') : 'text-gray-700']">{{ planUnresolvedCount }}</div>
+            <div v-if="planMaxSeverity && planUnresolvedCount > 0" class="mt-0.5">
+              <span :class="['tag border !py-0 !px-1.5 text-[10px]', maxSeverityColor]">{{ maxSeverityLabel }}</span>
             </div>
           </div>
         </div>
@@ -808,6 +909,13 @@ const riskIconMap = {
                         未分配
                       </span>
                     </template>
+                    <span
+                      v-if="getCharTaskCount(rc.characterId) > 0"
+                      class="tag border bg-cinnabar-50 text-cinnabar-700 border-cinnabar-200 shrink-0 flex items-center gap-1"
+                    >
+                      <ShieldAlert class="w-3 h-3" />
+                      {{ getCharTaskCount(rc.characterId) }} 巡检待办
+                    </span>
                   </div>
 
                   <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 sm:gap-4 mb-2">
@@ -874,6 +982,44 @@ const riskIconMap = {
                     >
                       <ClipboardCheck class="w-4 h-4 flex-shrink-0 mt-0.5" />
                       <span>交接备注：{{ getFullCharacter(rc.characterId)!.handoverNote }}</span>
+                    </div>
+
+                    <div v-if="getCharRehearsalTask(rc.characterId)" class="p-2 rounded-md border bg-cinnabar-50/40 border-cinnabar-200">
+                      <div class="flex items-center gap-2 mb-1">
+                        <ShieldAlert class="w-3.5 h-3.5 text-cinnabar-600 flex-shrink-0" />
+                        <span class="text-xs font-semibold text-cinnabar-800">{{ getCharRehearsalTask(rc.characterId)!.title }}</span>
+                        <span :class="['tag border !py-0 !px-1.5 text-[10px] ml-auto', getCharRehearsalTask(rc.characterId)!.status === 'blocked' ? 'bg-red-50 text-red-700 border-red-200' : getCharRehearsalTask(rc.characterId)!.status === 'in_progress' ? 'bg-cinnabar-50 text-cinnabar-700 border-cinnabar-200' : 'bg-blue-50 text-blue-700 border-blue-200']">
+                          {{ INSPECTION_STATUS_LABELS[getCharRehearsalTask(rc.characterId)!.status] }}
+                        </span>
+                      </div>
+                      <p v-if="getCharRehearsalTask(rc.characterId)!.description" class="text-[11px] text-ink-500 line-clamp-2 mb-1.5">
+                        {{ getCharRehearsalTask(rc.characterId)!.description }}
+                      </p>
+                      <div class="flex items-center gap-1">
+                        <button
+                          v-if="getCharRehearsalTask(rc.characterId)!.status === 'open'"
+                          class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-cinnabar-100 text-cinnabar-700 hover:bg-cinnabar-200 transition-colors"
+                          @click.stop="handleStartTask(getCharRehearsalTask(rc.characterId)!)"
+                        >
+                          <Play class="w-2.5 h-2.5" />
+                          开始处理
+                        </button>
+                        <button
+                          v-if="getCharRehearsalTask(rc.characterId)!.status !== 'resolved' && getCharRehearsalTask(rc.characterId)!.status !== 'dismissed'"
+                          class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-bamboo-100 text-bamboo-700 hover:bg-bamboo-200 transition-colors"
+                          @click.stop="handleResolveTask(getCharRehearsalTask(rc.characterId)!)"
+                        >
+                          <CheckCircle class="w-2.5 h-2.5" />
+                          标记解决
+                        </button>
+                        <router-link
+                          to="/tasks"
+                          class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-ink-500 hover:bg-rice-200 transition-colors ml-auto"
+                          @click.stop
+                        >
+                          查看全部
+                        </router-link>
+                      </div>
                     </div>
 
                     <div v-if="editingCharacterId !== rc.characterId && plan.status !== 'completed' && plan.status !== 'cancelled'" class="flex flex-wrap gap-2 pt-2 border-t border-rice-100">

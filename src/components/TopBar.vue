@@ -3,7 +3,6 @@ import { ref } from 'vue';
 import { useRouter } from 'vue-router';
 import {
   Upload,
-  Download,
   Plus,
   Eye,
   ListChecks,
@@ -13,13 +12,17 @@ import {
   Home,
   ClipboardCheck,
   Theater,
+  ShieldAlert,
+  Package,
 } from 'lucide-vue-next';
 import { useCharacters } from '../composables/useCharacters';
 import { useAutoCheck } from '../composables/useAutoCheck';
 import { useDemoMode } from '../composables/useDemoMode';
 import { useToast } from '../composables/useToast';
 import { useBatchOperations } from '../composables/useBatchOperations';
-import type { CharacterStatus } from '../types';
+import { useInspectionTasks } from '../composables/useInspectionTasks';
+import { useRehearsalPlans } from '../composables/useRehearsalPlans';
+import type { CharacterStatus, BackupPackage, BackupImportResult } from '../types';
 import { STATUS_LABELS, BATCH_STATUSES } from '../types';
 
 const router = useRouter();
@@ -33,25 +36,35 @@ const emit = defineEmits<{
   (e: 'dataImported'): void;
 }>();
 
-const { exportData, importData, characters } = useCharacters();
+const { exportData: exportCharacters, importData: importCharacters, replaceAll: replaceCharacters, characters } = useCharacters();
+const { exportData: exportPlans, replaceAll: replacePlans } = useRehearsalPlans();
+const { exportData: exportTasks, replaceAll: replaceTasks, validateReferences } = useInspectionTasks();
 const { errorCount, warningCount } = useAutoCheck();
 const { isDemoMode, toggleDemoMode } = useDemoMode();
 const { success, error, warning } = useToast();
 const { selectedIds, hasSelection, selectedCount, batchUpdateStatus, clearSelection } = useBatchOperations();
+const { openTaskCount, criticalTaskCount } = useInspectionTasks();
 
 const fileInputRef = ref<HTMLInputElement | null>(null);
 const showBatchMenu = ref(false);
 
 function handleExport() {
-  const json = exportData();
+  const backup: BackupPackage = {
+    version: 2,
+    exportedAt: new Date().toISOString(),
+    characters: JSON.parse(exportCharacters()),
+    rehearsalPlans: JSON.parse(exportPlans()),
+    inspectionTasks: JSON.parse(exportTasks()),
+  };
+  const json = JSON.stringify(backup, null, 2);
   const blob = new Blob([json], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `皮影演出核对备份_${new Date().toISOString().slice(0, 10)}.json`;
+  a.download = `检查台备份包_v2_${new Date().toISOString().slice(0, 10)}.json`;
   a.click();
   URL.revokeObjectURL(url);
-  success(`已保存 ${characters.value.length} 条角色核对记录`);
+  success(`已导出备份包：${backup.characters.length} 角色、${backup.rehearsalPlans.length} 排练计划、${backup.inspectionTasks.length} 巡检任务`);
 }
 
 function triggerImport() {
@@ -66,12 +79,27 @@ function handleFileChange(event: Event) {
   const reader = new FileReader();
   reader.onload = (e) => {
     const content = e.target?.result as string;
-    const result = importData(content);
+    const result = importBackup(content);
     if (result.success) {
-      if (result.invalidCount > 0) {
-        warning(`已载入 ${result.count} 条核对记录，另有 ${result.invalidCount} 条格式异常已跳过或补全`);
+      const parts: string[] = [];
+      if (result.isLegacy) {
+        parts.push(`已从旧版备份恢复 ${result.characters} 条角色记录`);
       } else {
-        success(`已载入 ${result.count} 条角色核对记录`);
+        parts.push(`已恢复 ${result.characters} 角色、${result.rehearsalPlans} 排练计划、${result.inspectionTasks} 巡检任务`);
+      }
+      if (result.duplicateIdCount > 0) {
+        parts.push(`${result.duplicateIdCount} 个重复 ID 已自动重建`);
+      }
+      if (result.blockedTaskCount > 0) {
+        parts.push(`${result.blockedTaskCount} 个关联缺失的任务已标记为阻塞`);
+      }
+      if (result.invalidCount > 0) {
+        parts.push(`${result.invalidCount} 条格式异常已跳过`);
+      }
+      if (result.duplicateIdCount > 0 || result.blockedTaskCount > 0 || result.invalidCount > 0) {
+        warning(parts.join('；'));
+      } else {
+        success(parts.join('；'));
       }
       clearSelection();
       emit('dataImported');
@@ -84,6 +112,74 @@ function handleFileChange(event: Event) {
   };
   reader.readAsText(file);
   target.value = '';
+}
+
+function importBackup(jsonStr: string): BackupImportResult {
+  const empty: BackupImportResult = {
+    success: false, characters: 0, rehearsalPlans: 0, inspectionTasks: 0,
+    invalidCount: 0, duplicateIdCount: 0, blockedTaskCount: 0, isLegacy: false,
+  };
+  try {
+    const parsed = JSON.parse(jsonStr);
+
+    if (Array.isArray(parsed)) {
+      const result = importCharacters(jsonStr);
+      if (!result.success) return empty;
+      const charIds = new Set(characters.value.map(c => c.id));
+      const blocked = validateReferences(charIds, new Set());
+      return {
+        success: true,
+        characters: result.count,
+        rehearsalPlans: 0,
+        inspectionTasks: 0,
+        invalidCount: result.invalidCount,
+        duplicateIdCount: 0,
+        blockedTaskCount: blocked,
+        isLegacy: true,
+      };
+    }
+
+    if (!parsed || typeof parsed !== 'object') return empty;
+
+    if (parsed.version !== 2) {
+      if (Array.isArray(parsed.characters)) {
+        return importCharacters(JSON.stringify(parsed.characters)).success
+          ? { ...empty, success: true, characters: parsed.characters.length, isLegacy: true }
+          : empty;
+      }
+      return empty;
+    }
+
+    let invalidCount = 0;
+    const rawChars = Array.isArray(parsed.characters) ? parsed.characters : [];
+    const rawPlans = Array.isArray(parsed.rehearsalPlans) ? parsed.rehearsalPlans : [];
+    const rawTasks = Array.isArray(parsed.inspectionTasks) ? parsed.inspectionTasks : [];
+
+    const charResult = replaceCharacters(rawChars);
+    const planResult = replacePlans(rawPlans);
+    const taskResult = replaceTasks(rawTasks);
+
+    invalidCount = Math.max(0, rawChars.length - charResult.count) +
+                   Math.max(0, rawPlans.length - planResult.count) +
+                   Math.max(0, rawTasks.length - taskResult.count);
+
+    const charIds = new Set(characters.value.map(c => c.id));
+    const planIds = new Set((JSON.parse(exportPlans()) as any[]).map(p => p.id));
+    const blocked = validateReferences(charIds, planIds);
+
+    return {
+      success: true,
+      characters: charResult.count,
+      rehearsalPlans: planResult.count,
+      inspectionTasks: taskResult.count,
+      invalidCount,
+      duplicateIdCount: charResult.duplicateIdCount + planResult.duplicateIdCount + taskResult.duplicateIdCount,
+      blockedTaskCount: blocked,
+      isLegacy: false,
+    };
+  } catch {
+    return empty;
+  }
 }
 
 function handleBatchStatus(status: CharacterStatus) {
@@ -170,6 +266,31 @@ function handleBatchStatus(status: CharacterStatus) {
             <span class="sm:hidden">排练</span>
           </button>
 
+          <button
+            :class="[
+              'relative inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-all',
+              router.currentRoute.value.name === 'inspection-tasks'
+                ? 'bg-white/20 text-white'
+                : criticalTaskCount > 0
+                  ? 'bg-red-500/30 text-white hover:bg-red-500/40 ring-1 ring-red-300/50'
+                  : 'bg-white/10 text-rice-100 hover:bg-white/20'
+            ]"
+            @click="router.push('/tasks')"
+          >
+            <ShieldAlert class="w-4 h-4" />
+            <span class="hidden sm:inline">巡检任务</span>
+            <span class="sm:hidden">任务</span>
+            <span
+              v-if="openTaskCount > 0"
+              :class="[
+                'absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] px-1 rounded-full text-[10px] font-bold flex items-center justify-center',
+                criticalTaskCount > 0 ? 'bg-red-500 text-white' : 'bg-gold-500 text-white'
+              ]"
+            >
+              {{ openTaskCount > 99 ? '99+' : openTaskCount }}
+            </span>
+          </button>
+
           <div class="flex items-center gap-2 mx-2 bg-white/10 rounded-md px-3 py-1.5">
             <AlertCircle class="w-4 h-4 text-rice-200" />
             <span class="text-xs">共 <span class="font-bold text-rice-100">{{ characters.length }}</span> 个角色</span>
@@ -197,11 +318,11 @@ function handleBatchStatus(status: CharacterStatus) {
 
           <button class="btn-secondary !py-1.5 !bg-white/10 !text-white !border-white/20 hover:!bg-white/20" @click="triggerImport">
             <Upload class="w-4 h-4" />
-            <span class="hidden sm:inline">载入</span>
+            <span class="hidden sm:inline">恢复</span>
           </button>
           <button class="btn-secondary !py-1.5 !bg-white/10 !text-white !border-white/20 hover:!bg-white/20" @click="handleExport">
-            <Download class="w-4 h-4" />
-            <span class="hidden sm:inline">备份</span>
+            <Package class="w-4 h-4" />
+            <span class="hidden sm:inline">备份包</span>
           </button>
 
           <div class="relative" v-if="hasSelection">

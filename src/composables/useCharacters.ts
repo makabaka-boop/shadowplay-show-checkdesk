@@ -2,6 +2,7 @@ import { ref, computed, watch } from 'vue';
 import type { Character } from '../types';
 import { normalizeCharacter } from '../types';
 import { mockCharacters } from '../data/mockData';
+import { useInspectionTasks } from './useInspectionTasks';
 
 const STORAGE_KEY = 'shadow-puppetry-characters';
 
@@ -85,6 +86,10 @@ export function useCharacters() {
     const index = characters.value.findIndex(c => c.id === id);
     if (index !== -1) {
       characters.value.splice(index, 1);
+      try {
+        const { blockTasksForCharacter } = useInspectionTasks();
+        blockTasksForCharacter(id);
+      } catch { /* inspection tasks not available */ }
       return true;
     }
     return false;
@@ -123,6 +128,23 @@ export function useCharacters() {
     return JSON.stringify(characters.value, null, 2);
   }
 
+  function replaceAll(newChars: Character[]): { count: number; duplicateIdCount: number } {
+    const seen = new Set<string>();
+    let duplicateIdCount = 0;
+    const normalized = newChars.map(c => {
+      const nc = normalizeCharacter(c);
+      if (seen.has(nc.id)) {
+        nc.id = generateId();
+        duplicateIdCount++;
+      }
+      seen.add(nc.id);
+      return nc;
+    });
+    characters.value = normalized;
+    notifyImportListeners();
+    return { count: normalized.length, duplicateIdCount };
+  }
+
   function importData(jsonStr: string): { success: boolean; count: number; invalidCount: number } {
     try {
       const parsed = JSON.parse(jsonStr);
@@ -142,9 +164,8 @@ export function useCharacters() {
           invalidCount++;
         }
       });
-      characters.value = normalized;
-      notifyImportListeners();
-      return { success: true, count: normalized.length, invalidCount };
+      const { count, duplicateIdCount } = replaceAll(normalized);
+      return { success: true, count, invalidCount: invalidCount + duplicateIdCount };
     } catch {
       return { success: false, count: 0, invalidCount: 0 };
     }
@@ -161,5 +182,6 @@ export function useCharacters() {
     allOwners,
     exportData,
     importData,
+    replaceAll,
   };
 }
