@@ -4,6 +4,7 @@ import StoryChecklist from '@/pages/StoryChecklist.vue'
 import HandoverBoard from '@/pages/HandoverBoard.vue'
 import RehearsalPlanList from '@/pages/RehearsalPlanList.vue'
 import RehearsalPlanDetail from '@/pages/RehearsalPlanDetail.vue'
+import InspectionTaskCenter from '@/pages/InspectionTaskCenter.vue'
 
 // 定义路由配置
 const routes = [
@@ -31,6 +32,11 @@ const routes = [
     path: '/rehearsal/:id',
     name: 'rehearsal-detail',
     component: RehearsalPlanDetail,
+  },
+  {
+    path: '/tasks',
+    name: 'inspection-tasks',
+    component: InspectionTaskCenter,
   },
   {
     path: '/about',

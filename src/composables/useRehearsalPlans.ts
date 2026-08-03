@@ -2,6 +2,7 @@ import { ref, computed, watch } from 'vue';
 import type { RehearsalPlan, RehearsalCharacter, RehearsalStatus, RehearsalResult, Character } from '../types';
 import { normalizeRehearsalPlan } from '../types';
 import { useCharacters } from './useCharacters';
+import { useInspectionTasks } from './useInspectionTasks';
 
 const STORAGE_KEY = 'shadow-puppetry-rehearsal-plans';
 
@@ -85,6 +86,8 @@ watch(rehearsalPlans, (newVal) => {
   saveToStorage(newVal);
 }, { deep: true });
 
+let _rehearsalSyncInitialized = false;
+
 export function useRehearsalPlans() {
   const { characters } = useCharacters();
 
@@ -95,17 +98,34 @@ export function useRehearsalPlans() {
   function cleanInvalidCharacters() {
     const validIds = new Set(characters.value.map(c => c.id));
     let changed = false;
-    rehearsalPlans.value.forEach((plan, idx) => {
-      const valid = plan.characters.filter(c => validIds.has(c.characterId));
-      if (valid.length !== plan.characters.length) {
-        rehearsalPlans.value[idx] = normalizeRehearsalPlan({
-          ...plan,
-          characters: valid,
-          updatedAt: new Date().toISOString(),
-        });
-        changed = true;
-      }
-    });
+    try {
+      const { blockRehearsalTaskForRemoval } = useInspectionTasks();
+      rehearsalPlans.value.forEach((plan, idx) => {
+        const removed = plan.characters.filter(c => !validIds.has(c.characterId));
+        const valid = plan.characters.filter(c => validIds.has(c.characterId));
+        if (valid.length !== plan.characters.length) {
+          removed.forEach(rc => blockRehearsalTaskForRemoval(plan.id, rc.characterId));
+          rehearsalPlans.value[idx] = normalizeRehearsalPlan({
+            ...plan,
+            characters: valid,
+            updatedAt: new Date().toISOString(),
+          });
+          changed = true;
+        }
+      });
+    } catch {
+      rehearsalPlans.value.forEach((plan, idx) => {
+        const valid = plan.characters.filter(c => validIds.has(c.characterId));
+        if (valid.length !== plan.characters.length) {
+          rehearsalPlans.value[idx] = normalizeRehearsalPlan({
+            ...plan,
+            characters: valid,
+            updatedAt: new Date().toISOString(),
+          });
+          changed = true;
+        }
+      });
+    }
     return changed;
   }
 
@@ -151,6 +171,10 @@ export function useRehearsalPlans() {
     const index = rehearsalPlans.value.findIndex(p => p.id === id);
     if (index !== -1) {
       rehearsalPlans.value.splice(index, 1);
+      try {
+        const { blockTasksForPlan } = useInspectionTasks();
+        blockTasksForPlan(id);
+      } catch { /* inspection tasks not available */ }
       return true;
     }
     return false;
@@ -259,6 +283,95 @@ export function useRehearsalPlans() {
     return { total, pass, fail, needRehearse, notStarted, progress, passRate };
   }
 
+  function syncRehearsalTasks(): number {
+    let created = 0;
+    try {
+      const {
+        addTask: addInspectionTask,
+        findExistingTask,
+        updateTask,
+        upsertRehearsalResultTask,
+      } = useInspectionTasks();
+
+      rehearsalPlans.value.forEach(plan => {
+        if (plan.problemNotes.trim()) {
+          const sourceId = `${plan.id}:problem`;
+          const existing = findExistingTask('rehearsal', sourceId);
+          if (!existing) {
+            addInspectionTask({
+              sourceType: 'rehearsal',
+              sourceId,
+              story: plan.story,
+              characterId: '',
+              planId: plan.id,
+              title: `处理「${plan.name}」排练问题`,
+              description: plan.problemNotes,
+              severity: 'medium',
+              status: 'open',
+              assignee: plan.owner || '',
+              dueAt: '',
+              resolvedAt: '',
+            });
+            created++;
+          } else if (existing.status === 'blocked') {
+            updateTask(existing.id, { status: 'open' });
+          }
+        }
+
+        plan.characters.forEach(rc => {
+          if (rc.rehearsalResult === 'fail' || rc.rehearsalResult === 'need_rehearse') {
+            const char = characters.value.find(c => c.id === rc.characterId);
+            const charName = char?.name || rc.characterId;
+            const { created: wasCreated } = upsertRehearsalResultTask(
+              { id: plan.id, name: plan.name, story: plan.story, owner: plan.owner },
+              rc.characterId,
+              charName,
+              rc.rehearsalResult,
+              rc.rehearsalNote,
+              rc.checkedBy
+            );
+            if (wasCreated) created++;
+          }
+        });
+      });
+    } catch {
+      // inspection tasks not available
+    }
+    return created;
+  }
+
+  function generatePlanId(): string {
+    return 'rh_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  }
+
+  function exportData(): string {
+    return JSON.stringify(rehearsalPlans.value, null, 2);
+  }
+
+  function replaceAll(newPlans: RehearsalPlan[]): { count: number; duplicateIdCount: number } {
+    const seen = new Set<string>();
+    let duplicateIdCount = 0;
+    const normalized = newPlans.map(p => {
+      const np = normalizeRehearsalPlan(p);
+      if (seen.has(np.id)) {
+        np.id = generatePlanId();
+        duplicateIdCount++;
+      }
+      seen.add(np.id);
+      return np;
+    });
+    rehearsalPlans.value = normalized;
+    return { count: normalized.length, duplicateIdCount };
+  }
+
+  if (!_rehearsalSyncInitialized) {
+    _rehearsalSyncInitialized = true;
+    watch(rehearsalPlans, () => {
+      syncRehearsalTasks();
+    }, { deep: true });
+    setTimeout(() => syncRehearsalTasks(), 0);
+  }
+
   return {
     rehearsalPlans,
     addPlan,
@@ -274,5 +387,8 @@ export function useRehearsalPlans() {
     getPlanStats,
     getValidPlanCharacters,
     cleanInvalidCharacters,
+    syncRehearsalTasks,
+    exportData,
+    replaceAll,
   };
 }

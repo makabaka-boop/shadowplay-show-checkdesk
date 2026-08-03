@@ -1,9 +1,11 @@
 import { computed } from 'vue';
 import type { CheckResult, Character } from '../types';
 import { useCharacters } from './useCharacters';
+import { useInspectionTasks } from './useInspectionTasks';
 
 export function useAutoCheck() {
   const { characters } = useCharacters();
+  const { getUnresolvedTaskCountByCharacter } = useInspectionTasks();
 
   function hasMissingAccessories(char: Character): boolean {
     return char.missingAccessories.some(a => a.available < a.required);
@@ -105,6 +107,18 @@ export function useAutoCheck() {
       });
     }
 
+    // 7. 检查未解决巡检任务
+    const withUnresolvedTaskIds = chars
+      .filter(c => getUnresolvedTaskCountByCharacter(c.id) > 0)
+      .map(c => c.id);
+    if (withUnresolvedTaskIds.length > 0) {
+      results.push({
+        type: 'warning',
+        message: `${withUnresolvedTaskIds.length} 个角色存在未解决的巡检任务`,
+        characterIds: withUnresolvedTaskIds,
+      });
+    }
+
     return results;
   });
 
@@ -114,6 +128,10 @@ export function useAutoCheck() {
 
   function characterHasIssues(charId: string): boolean {
     return allCheckResults.value.some(r => r.characterIds.includes(charId));
+  }
+
+  function characterHasUnresolvedTasks(charId: string): boolean {
+    return getUnresolvedTaskCountByCharacter(charId) > 0;
   }
 
   const hasAnyIssues = computed(() => allCheckResults.value.length > 0);
@@ -130,6 +148,8 @@ export function useAutoCheck() {
     allCheckResults,
     getCharacterIssues,
     characterHasIssues,
+    characterHasUnresolvedTasks,
+    getUnresolvedTaskCountByCharacter,
     hasAnyIssues,
     errorCount,
     warningCount,

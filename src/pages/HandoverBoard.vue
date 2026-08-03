@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue';
+import { useRouter } from 'vue-router';
 import {
   ChevronLeft,
   ChevronRight,
@@ -21,18 +22,35 @@ import {
   Filter,
   ListTodo,
   ListChecks,
+  ShieldAlert,
+  Play,
+  Pause,
+  ExternalLink,
+  RefreshCw,
+  Trash2,
 } from 'lucide-vue-next';
 import TopBar from '../components/TopBar.vue';
 import ToastContainer from '../components/ToastContainer.vue';
 import { useCharacters } from '../composables/useCharacters';
 import { useToast } from '../composables/useToast';
 import { useBatchOperations } from '../composables/useBatchOperations';
-import type { Character, HandoverStatus, RiskLevel } from '../types';
-import { HANDOVER_LABELS, RISK_LABELS } from '../types';
+import { useInspectionTasks } from '../composables/useInspectionTasks';
+import type { Character, HandoverStatus, RiskLevel, InspectionTask, InspectionTaskStatus } from '../types';
+import { HANDOVER_LABELS, RISK_LABELS, INSPECTION_STATUS_LABELS } from '../types';
 
+const router = useRouter();
 const { characters, allStories, updateCharacter } = useCharacters();
 const { success, warning } = useToast();
 const { clearSelection } = useBatchOperations();
+const {
+  getUnresolvedTasksByCharacter,
+  getUnresolvedTaskCountByCharacter,
+  upsertHandoverTaskForCharacter,
+  syncHandoverNoteToTask,
+  updateTask,
+  resolveTask,
+  deleteTask,
+} = useInspectionTasks();
 
 const selectedStory = ref<string>('');
 const selectedOwner = ref<string>('');
@@ -256,24 +274,120 @@ function cancelEdit() {
 
 function saveEdit(char: Character) {
   if (editHandoverStatus.value === 'confirmed' && hasObjectiveRisk(char)) {
-    warning('该角色存在缺件、高风险或未分配责任人，无法标记为可交接');
+    updateCharacter(char.id, {
+      handoverNote: editHandoverNote.value,
+    });
+    const task = upsertHandoverTaskForCharacter(char.id, editHandoverNote.value);
+    const riskReasons: string[] = [];
+    if (char.missingAccessories.some(a => a.available < a.required)) riskReasons.push('缺件');
+    if (char.riskLevel === 'high' || char.riskLevel === 'critical') riskReasons.push('高风险');
+    if (!char.owner.trim()) riskReasons.push('未分配责任人');
+    warning(`无法标记为可交接（${riskReasons.join('、')}），已${task ? '更新' : '创建'}巡检任务追踪`);
+    editingId.value = null;
     return;
   }
   updateCharacter(char.id, {
     handoverStatus: editHandoverStatus.value,
     handoverNote: editHandoverNote.value,
   });
+  if (editHandoverStatus.value === 'has_risk' || editHandoverStatus.value === 'follow_up') {
+    upsertHandoverTaskForCharacter(char.id, editHandoverNote.value);
+  }
   success(`已更新「${char.name}」的交接状态`);
   editingId.value = null;
 }
 
 function quickHandoverStatus(char: Character, status: HandoverStatus) {
   if (status === 'confirmed' && hasObjectiveRisk(char)) {
-    warning('该角色存在缺件、高风险或未分配责任人，无法标记为可交接');
+    const task = upsertHandoverTaskForCharacter(char.id);
+    const riskReasons: string[] = [];
+    if (char.missingAccessories.some(a => a.available < a.required)) riskReasons.push('缺件');
+    if (char.riskLevel === 'high' || char.riskLevel === 'critical') riskReasons.push('高风险');
+    if (!char.owner.trim()) riskReasons.push('未分配责任人');
+    warning(`无法标记为可交接（${riskReasons.join('、')}），已${task ? '更新' : '创建'}巡检任务追踪`);
     return;
   }
   updateCharacter(char.id, { handoverStatus: status });
+  if (status === 'has_risk' || status === 'follow_up') {
+    upsertHandoverTaskForCharacter(char.id);
+  }
   success(`「${char.name}」已标记为「${HANDOVER_LABELS[status]}」`);
+}
+
+function getCharTasks(charId: string): InspectionTask[] {
+  return getUnresolvedTasksByCharacter(charId);
+}
+
+function getCharTaskCount(charId: string): number {
+  return getUnresolvedTaskCountByCharacter(charId);
+}
+
+function handleSyncNoteToTask(char: Character) {
+  const task = syncHandoverNoteToTask(char.id, char.handoverNote);
+  if (task) {
+    success(`已将「${char.name}」的交接备注同步到巡检任务描述`);
+  } else {
+    warning('同步失败：未找到关联角色');
+  }
+}
+
+function handleQuickTaskAction(task: InspectionTask, action: 'start' | 'resolve' | 'dismiss') {
+  if (action === 'start') {
+    updateTask(task.id, { status: 'in_progress' as InspectionTaskStatus });
+    success(`任务「${task.title}」已开始处理`);
+  } else if (action === 'resolve') {
+    resolveTask(task.id);
+    success(`任务「${task.title}」已标记为解决`);
+  } else if (action === 'dismiss') {
+    updateTask(task.id, { status: 'dismissed' as InspectionTaskStatus });
+    success(`任务「${task.title}」已忽略`);
+  }
+}
+
+function handleDeleteTask(task: InspectionTask) {
+  if (confirm(`确定删除任务「${task.title}」吗？`)) {
+    deleteTask(task.id);
+    success('任务已删除');
+  }
+}
+
+function goToTaskSource(task: InspectionTask) {
+  if (task.sourceType === 'handover' || task.sourceType === 'character') {
+    return;
+  }
+  if (task.sourceType === 'rehearsal' && task.planId) {
+    router.push(`/rehearsal/${task.planId}`);
+  } else {
+    router.push('/tasks');
+  }
+}
+
+const taskStatusStyles: Record<InspectionTaskStatus, string> = {
+  open: 'bg-blue-50 text-blue-700 border-blue-200',
+  in_progress: 'bg-cinnabar-50 text-cinnabar-700 border-cinnabar-200',
+  blocked: 'bg-red-50 text-red-700 border-red-200',
+  resolved: 'bg-bamboo-50 text-bamboo-700 border-bamboo-200',
+  dismissed: 'bg-gray-50 text-gray-500 border-gray-200',
+};
+
+function getTaskStatusIcon(status: InspectionTaskStatus) {
+  switch (status) {
+    case 'open': return Clock;
+    case 'in_progress': return Play;
+    case 'blocked': return Pause;
+    case 'resolved': return CheckCircle;
+    case 'dismissed': return X;
+  }
+}
+
+function getTaskSourceLabel(sourceType: string): string {
+  const labels: Record<string, string> = {
+    character: '角色清单',
+    handover: '交接核对',
+    rehearsal: '排练计划',
+    manual: '手工创建',
+  };
+  return labels[sourceType] || sourceType;
 }
 
 function selectNextStory() {
@@ -737,6 +851,13 @@ const preparationPercentage = computed(() => {
                           <UserX class="w-3 h-3 mr-1" />
                           未分配责任人
                         </span>
+                        <span
+                          v-if="getCharTaskCount(char.id) > 0"
+                          class="tag border bg-cinnabar-50 text-cinnabar-700 border-cinnabar-200 shrink-0 flex items-center gap-1"
+                        >
+                          <ShieldAlert class="w-3 h-3" />
+                          {{ getCharTaskCount(char.id) }} 巡检待办
+                        </span>
                       </div>
 
                       <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 sm:gap-4 mb-2">
@@ -778,8 +899,88 @@ const preparationPercentage = computed(() => {
                         <div v-if="hasObjectiveRisk(char)" class="p-2 bg-red-50 border border-red-200 rounded-md">
                           <p class="text-xs text-red-600 flex items-center gap-1">
                             <AlertOctagon class="w-4 h-4 flex-shrink-0" />
-                            <span>该角色存在客观风险（缺件/高风险/未分配责任人），不能标记为「可交接」</span>
+                            <span>该角色存在客观风险（缺件/高风险/未分配责任人），不能标记为「可交接」，已自动创建巡检任务追踪</span>
                           </p>
+                        </div>
+
+                        <div v-if="getCharTasks(char.id).length > 0" class="pt-2 border-t border-rice-100">
+                          <div class="flex items-center justify-between mb-2">
+                            <div class="flex items-center gap-1.5 text-xs font-semibold text-ink-600">
+                              <ShieldAlert class="w-3.5 h-3.5 text-cinnabar-600" />
+                              <span>关联巡检任务（{{ getCharTasks(char.id).length }}）</span>
+                            </div>
+                            <button
+                              v-if="char.handoverNote && hasObjectiveRisk(char)"
+                              class="inline-flex items-center gap-1 text-[11px] text-cinnabar-600 hover:text-cinnabar-800 transition-colors"
+                              @click.stop="handleSyncNoteToTask(char)"
+                            >
+                              <RefreshCw class="w-3 h-3" />
+                              同步备注到任务
+                            </button>
+                          </div>
+                          <div class="space-y-1.5">
+                            <div
+                              v-for="task in getCharTasks(char.id)"
+                              :key="task.id"
+                              :class="[
+                                'p-2 rounded-md border text-xs',
+                                task.status === 'blocked'
+                                  ? 'bg-red-50 border-red-200'
+                                  : task.status === 'in_progress'
+                                  ? 'bg-cinnabar-50 border-cinnabar-200'
+                                  : 'bg-white border-rice-200'
+                              ]"
+                            >
+                              <div class="flex items-start justify-between gap-2">
+                                <div class="flex-1 min-w-0">
+                                  <div class="flex items-center gap-1.5 flex-wrap mb-0.5">
+                                    <span class="font-medium text-ink-800">{{ task.title }}</span>
+                                    <span :class="['tag border !py-0 !px-1.5 text-[10px]', taskStatusStyles[task.status]]">
+                                      {{ INSPECTION_STATUS_LABELS[task.status] }}
+                                    </span>
+                                    <span class="tag border !py-0 !px-1.5 text-[10px] bg-ink-50 text-ink-500 border-ink-200">
+                                      {{ getTaskSourceLabel(task.sourceType) }}
+                                    </span>
+                                  </div>
+                                  <p v-if="task.description" class="text-ink-500 line-clamp-2">{{ task.description }}</p>
+                                </div>
+                              </div>
+                              <div class="flex items-center gap-1 mt-1.5 pt-1.5 border-t border-rice-100">
+                                <button
+                                  v-if="task.status === 'open'"
+                                  class="p-1 rounded hover:bg-cinnabar-100 text-cinnabar-600 transition-colors"
+                                  title="开始处理"
+                                  @click.stop="handleQuickTaskAction(task, 'start')"
+                                >
+                                  <Play class="w-3 h-3" />
+                                </button>
+                                <button
+                                  v-if="task.status !== 'resolved' && task.status !== 'dismissed'"
+                                  class="p-1 rounded hover:bg-bamboo-100 text-bamboo-600 transition-colors"
+                                  title="标记解决"
+                                  @click.stop="handleQuickTaskAction(task, 'resolve')"
+                                >
+                                  <CheckCircle class="w-3 h-3" />
+                                </button>
+                                <button
+                                  v-if="task.sourceType === 'rehearsal' && task.planId"
+                                  class="p-1 rounded hover:bg-rice-200 text-ink-400 transition-colors ml-auto"
+                                  title="查看来源"
+                                  @click.stop="goToTaskSource(task)"
+                                >
+                                  <ExternalLink class="w-3 h-3" />
+                                </button>
+                                <button
+                                  v-if="task.sourceType === 'manual'"
+                                  class="p-1 rounded hover:bg-red-100 text-red-400 transition-colors ml-auto"
+                                  title="删除任务"
+                                  @click.stop="handleDeleteTask(task)"
+                                >
+                                  <Trash2 class="w-3 h-3" />
+                                </button>
+                              </div>
+                            </div>
+                          </div>
                         </div>
 
                         <div v-if="editingId !== char.id" class="flex flex-wrap gap-2 pt-2 border-t border-rice-100">

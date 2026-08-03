@@ -186,6 +186,82 @@ export const REHEARSAL_RESULT_LABELS: Record<RehearsalResult, string> = {
   need_rehearse: '需复排',
 };
 
+export type InspectionSourceType = 'character' | 'handover' | 'rehearsal' | 'manual';
+export type InspectionSeverity = 'low' | 'medium' | 'high' | 'critical';
+export type InspectionTaskStatus = 'open' | 'in_progress' | 'blocked' | 'resolved' | 'dismissed';
+
+export interface InspectionTask {
+  id: string;
+  sourceType: InspectionSourceType;
+  sourceId: string;
+  story: string;
+  characterId: string;
+  planId: string;
+  title: string;
+  description: string;
+  severity: InspectionSeverity;
+  status: InspectionTaskStatus;
+  assignee: string;
+  dueAt: string;
+  resolvedAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export const INSPECTION_SOURCE_LABELS: Record<InspectionSourceType, string> = {
+  character: '角色清单',
+  handover: '交接核对',
+  rehearsal: '排练计划',
+  manual: '手工创建',
+};
+
+export const INSPECTION_SEVERITY_LABELS: Record<InspectionSeverity, string> = {
+  low: '低',
+  medium: '中',
+  high: '高',
+  critical: '紧急',
+};
+
+export const INSPECTION_STATUS_LABELS: Record<InspectionTaskStatus, string> = {
+  open: '待处理',
+  in_progress: '处理中',
+  blocked: '已阻塞',
+  resolved: '已解决',
+  dismissed: '已忽略',
+};
+
+export function normalizeInspectionTask(raw: any): InspectionTask {
+  const sourceTypes: InspectionSourceType[] = ['character', 'handover', 'rehearsal', 'manual'];
+  const severities: InspectionSeverity[] = ['low', 'medium', 'high', 'critical'];
+  const statuses: InspectionTaskStatus[] = ['open', 'in_progress', 'blocked', 'resolved', 'dismissed'];
+
+  const now = new Date().toISOString();
+  const safeStr = (v: any, fallback = ''): string =>
+    typeof v === 'string' ? v : v != null ? String(v) : fallback;
+
+  const st = safeStr(raw?.sourceType, 'manual');
+  const sv = safeStr(raw?.severity, 'medium');
+  const ts = safeStr(raw?.status, 'open');
+
+  return {
+    id: safeStr(raw?.id, 'task_' + Math.random().toString(36).slice(2, 12)),
+    sourceType: sourceTypes.includes(st as InspectionSourceType) ? (st as InspectionSourceType) : 'manual',
+    sourceId: safeStr(raw?.sourceId, ''),
+    story: safeStr(raw?.story, ''),
+    characterId: safeStr(raw?.characterId, ''),
+    planId: safeStr(raw?.planId, ''),
+    title: safeStr(raw?.title, '未命名任务'),
+    description: safeStr(raw?.description, ''),
+    severity: severities.includes(sv as InspectionSeverity) ? (sv as InspectionSeverity) : 'medium',
+    status: statuses.includes(ts as InspectionTaskStatus) ? (ts as InspectionTaskStatus) : 'open',
+    assignee: safeStr(raw?.assignee, ''),
+    dueAt: safeStr(raw?.dueAt, ''),
+    resolvedAt: safeStr(raw?.resolvedAt, ''),
+    createdAt: safeStr(raw?.createdAt, now),
+    updatedAt: safeStr(raw?.updatedAt, now),
+  };
+}
+
 export function normalizeRehearsalPlan(raw: any): RehearsalPlan {
   const statuses: RehearsalStatus[] = ['draft', 'scheduled', 'in_progress', 'completed', 'cancelled'];
   const results: RehearsalResult[] = ['not_started', 'pass', 'fail', 'need_rehearse'];
@@ -222,4 +298,23 @@ export function normalizeRehearsalPlan(raw: any): RehearsalPlan {
     createdAt: safeStr(raw?.createdAt, now),
     updatedAt: safeStr(raw?.updatedAt, now),
   };
+}
+
+export interface BackupPackage {
+  version: 2;
+  exportedAt: string;
+  characters: Character[];
+  rehearsalPlans: RehearsalPlan[];
+  inspectionTasks: InspectionTask[];
+}
+
+export interface BackupImportResult {
+  success: boolean;
+  characters: number;
+  rehearsalPlans: number;
+  inspectionTasks: number;
+  invalidCount: number;
+  duplicateIdCount: number;
+  blockedTaskCount: number;
+  isLegacy: boolean;
 }
